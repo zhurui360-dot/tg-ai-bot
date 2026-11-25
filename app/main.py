@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, bot, db, memory, security
+from . import __version__, bot, db, memory, security, updater
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -741,3 +741,43 @@ def clear_memory(
 ) -> dict[str, Any]:
     removed = db.clear_notes(agent_id, scope or "")
     return {"ok": True, "removed": removed, "stats": db.note_stats(agent_id)}
+
+
+# ---------------- 在线升级 ----------------
+
+@app.get("/api/update/check")
+def update_check(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """查 GitHub 上有没有新版本。顺带当容器出网探针用。"""
+    info = updater.check()
+    info["version"] = __version__
+    return info
+
+
+@app.post("/api/update/apply")
+def update_apply(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """下载最新代码并重启进程。
+
+    升级成功就触发重启，当前连接会断一下 —— 前端拿到 ok 后再轮询 /health，
+    等它回来就算完成。故意不在这里等重启，否则响应发不出去。
+    """
+    result = updater.install_code()
+    if result.get("ok") and not result.get("already_latest"):
+        updater.restart_process(delay=1.5)
+        result["restarting"] = True
+    return result
+
+
+@app.get("/api/update/status")
+def update_status(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """当前版本、升级历史。"""
+    state = updater.read_state()
+    return {
+        "version": __version__,
+        "repo": updater.REPO,
+        "branch": updater.BRANCH,
+        "commit": state.get("commit", ""),
+        "short": state.get("short", ""),
+        "installed_at": state.get("installed_at", ""),
+        "last_check": state.get("last_check", ""),
+        "code_dir": str(updater.CODE_DIR),
+    }

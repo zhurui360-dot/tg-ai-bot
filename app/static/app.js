@@ -443,6 +443,7 @@
       loadMemory().catch(function (err) { toast(err.message, "err"); });
     } else if (tab === "settings") {
       fillSettings();
+      loadUpdateStatus();
     } else {
       loadMessages(12).then(renderDashboard).catch(function () {});
     }
@@ -1457,7 +1458,109 @@
   }
 
   /* ======================================================================
-     12. 出网诊断
+     12. 在线升级
+     ====================================================================== */
+
+  async function loadUpdateStatus() {
+    try {
+      var data = await api("/api/update/status");
+      state.update = data;
+      text("updVersion", "v" + (data.version || "?"));
+      text("updCommit", data.short ? data.short + (data.installed_at ? "（" + data.installed_at + " 升级）" : "") : "镜像内置版本");
+      text("updRepo", data.repo + " @ " + data.branch);
+      text("updCheckedAt", data.last_check ? "上次检查 " + data.last_check : "");
+    } catch (err) {
+      console.warn("升级状态加载失败", err);
+    }
+  }
+
+  async function checkUpdate(btn) {
+    if (btn) busy(btn, true);
+    var box = $("#updateResult");
+    if (box) box.innerHTML = '<p class="dim small mb-0">正在连接 GitHub…</p>';
+    try {
+      var data = await api("/api/update/check");
+      renderUpdateCheck(data);
+      text("updCheckedAt", "上次检查 " + (data.checked_at || ""));
+    } catch (err) {
+      if (box) box.innerHTML = notice("err", "检查失败", err.message);
+    } finally {
+      if (btn) busy(btn, false);
+    }
+  }
+
+  function renderUpdateCheck(data) {
+    var box = $("#updateResult");
+    if (!box) return;
+    if (!data.ok) {
+      box.innerHTML = notice("err", data.error || "检查失败", data.hint || "确认容器能访问外网。");
+      return;
+    }
+    var parts = [];
+    if (data.has_update) {
+      parts.push(notice("warn", "发现新版本",
+        "线上最新 " + data.remote_commit + "，当前 " + (data.current_short || "镜像内置") +
+        (data.remote_message ? "。最新改动：" + data.remote_message : "")));
+    } else {
+      parts.push(notice("ok", "已是最新", data.note || ("线上最新 " + data.remote_commit + "，与当前一致。")));
+    }
+    box.innerHTML = parts.join("");
+  }
+
+  async function applyUpdate(btn) {
+    var ok = await confirmDialog({
+      title: "升级到最新版本？",
+      message: "会从 GitHub 下载最新代码并重启服务，中断几秒。数据库、机器人配置、智能体、记忆都保留。",
+      okText: "升级"
+    });
+    if (!ok) return;
+    if (btn) busy(btn, true);
+    var box = $("#updateResult");
+    if (box) box.innerHTML = '<p class="dim small mb-0">正在下载代码…（大文件可能要几十秒）</p>';
+    try {
+      var data = await api("/api/update/apply");
+      if (!data.ok) {
+        if (box) box.innerHTML = notice("err", data.error || "升级失败", data.hint || "");
+        if (btn) busy(btn, false);
+        return;
+      }
+      if (data.already_latest) {
+        if (box) box.innerHTML = notice("ok", "无需升级", data.message || "已经是最新版本。");
+        if (btn) busy(btn, false);
+        return;
+      }
+      if (box) box.innerHTML = notice("ok", "升级完成", data.message || "服务正在重启，页面会自动刷新。");
+      waitForRestart();
+    } catch (err) {
+      // 重启时连接会断，fetch 抛错是正常现象，不当作失败
+      if (box) box.innerHTML = notice("ok", "正在重启", "服务重启中，稍等几秒后页面自动刷新。");
+      waitForRestart();
+    }
+  }
+
+  function waitForRestart() {
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries++;
+      fetch("/health", { cache: "no-store" })
+        .then(function (res) { return res.ok ? res.json() : null; })
+        .then(function (data) {
+          if (data && data.status === "ok") {
+            clearInterval(timer);
+            toast("升级完成，正在刷新", "ok");
+            setTimeout(function () { location.reload(); }, 800);
+          }
+        })
+        .catch(function () { /* 还没起来，继续等 */ });
+      if (tries > 40) {
+        clearInterval(timer);
+        toast("重启超时，请手动刷新页面", "err");
+      }
+    }, 1500);
+  }
+
+  /* ======================================================================
+     13. 出网诊断
      ====================================================================== */
 
   async function runDiagnose(btn) {
@@ -1552,6 +1655,8 @@
     "note-del": deleteNote,
     "save-panel": savePanelSettings,
     "save-memory": saveMemorySettings,
+    "update-check": checkUpdate,
+    "update-apply": applyUpdate,
     "clear-messages": clearMessages,
     messages: openMessages,
     logout: logout,

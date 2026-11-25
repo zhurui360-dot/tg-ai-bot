@@ -17,11 +17,14 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+# 代码放在 /opt/baseline 作为只读基线。
+# 运行时 entrypoint 会把它复制一份到 $DATA_DIR/code（可写卷）跑，
+# 面板的「在线升级」覆盖的是那一份 —— 容器里的进程改不了镜像本身。
+COPY app /opt/baseline/app
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
     && mkdir -p /app/data \
-    && chown -R app:app /app
+    && chown -R app:app /app /opt/baseline
 
 EXPOSE 8000
 
