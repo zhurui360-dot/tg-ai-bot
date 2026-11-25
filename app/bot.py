@@ -1,0 +1,1284 @@
+"""Telegram AI 机器人：走 Bot API，只需要 BotFather 给的 token。
+
+能力：
+- 私聊必回；群聊里被 @ 或回复机器人的消息才回。
+- 接入任意 OpenAI 兼容大模型，按智能体配置人设、模型、温度、上下文条数。
+- 智能体有自己的名字，命名后模型知道自己叫什么。
+- 上下文记忆 + 长期记忆提炼（见 memory.py）。
+- 开启 Telegram Business 后还能以账号主人身份回复私聊（见 business 相关函数）。
+
+支持多个机器人：每个 bot 一条记录（bots 表），各自一个轮询线程、各自的
+update_offset / Business 连接，互不干扰。
+长轮询用 getUpdates 游标，游标落库，进程重启后不会重复回复旧消息。
+"""
+from __future__ import annotations
+
+import functools
+import http.client
+import json
+import logging
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+from . import db, memory, security
+
+log = logging.getLogger("tg-ai-bot.bot")
+
+# Telegram API 根地址。默认官方域名；填了 TG_API_ROOT 就用它（自建反代 / 中转）。
+# 部署在无法直连 telegram.org 的网络里时，这是最省事的一条路：
+# 找一台能出网的机器把 /bot 路径反向代理回来，然后把这里指向它。
+API_ROOT = (os.getenv("TG_API_ROOT", "").strip().rstrip("/")) or "https://api.telegram.org"
+
+# 出网代理。留空 = 直连。
+# 支持 http://、https://、socks5://、socks5h://，带账号密码也行。
+# 为什么需要它：容器默认会绕开环境变量里的 http_proxy（见 _build_opener），
+# 所以只设 http_proxy 是没用的，必须显式给这一项。
+TG_PROXY = os.getenv("TG_PROXY", "").strip()
+
+
+class _SocksHTTPConnection(http.client.HTTPConnection):
+    """把 connect() 换成走 SOCKS 的版本。
+
+    不 patch 全局 socket：服务端自己的监听/accept 也走 socket 模块，
+    全局替换会连入站连接一起改掉，容易把面板搞挂。这里只影响出站这一条链。
+    """
+
+    _proxy: tuple = ()
+
+    def __init__(self, *args: Any, proxy: tuple = (), **kwargs: Any) -> None:
+        self._proxy = proxy
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        self.sock = _socks_connect(self._proxy, self.host, self.port, self.timeout)
+
+
+class _SocksHTTPSConnection(http.client.HTTPSConnection):
+    _proxy: tuple = ()
+
+    def __init__(self, *args: Any, proxy: tuple = (), **kwargs: Any) -> None:
+        self._proxy = proxy
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        raw = _socks_connect(self._proxy, self.host, self.port, self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+
+def _socks_connect(proxy: tuple, host: str, port: int, timeout: Any):
+    import socket as _socket
+
+    try:
+        import socks  # PySocks
+    except ImportError as exc:  # 依赖没装时给一句能看懂的话
+        raise OSError("SOCKS 代理需要 PySocks，镜像里已包含，请确认 requirements.txt 没被改动") from exc
+    _, phost, pport, puser, ppass = proxy
+    sock = socks.socksocket()
+    sock.set_proxy(socks.SOCKS5, phost, pport, True, puser or None, ppass or None)
+    if timeout:
+        sock.settimeout(timeout)
+    sock.connect((host, int(port)))
+    return sock
+
+
+class _SocksProxyHandler(urllib.request.HTTPSHandler):
+    """同时接管 http/https，全部经 SOCKS 出去。"""
+
+    def __init__(self, proxy: tuple) -> None:
+        super().__init__()
+        self._proxy = proxy
+        self._http_cls = functools.partial(_SocksHTTPConnection, proxy=proxy)
+        self._https_cls = functools.partial(_SocksHTTPSConnection, proxy=proxy)
+
+    def http_open(self, req):
+        return self.do_open(self._http_cls, req)
+
+    def https_open(self, req):
+        return self.do_open(self._https_cls, req, context=self._context)
+
+
+def _parse_proxy(raw: str) -> tuple | None:
+    """把代理串解析成 (kind, host, port, user, password)。解析不出来就当没配。"""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        # 用户常直接填 192.168.1.2:7890，补一个默认协议
+        text = "http://" + text
+    try:
+        parsed = urllib.parse.urlparse(text)
+        scheme = (parsed.scheme or "http").lower()
+        if not parsed.hostname:
+            return None
+        kind = "socks5" if scheme.startswith("socks") else "http"
+        from urllib.parse import unquote
+
+        port = parsed.port or (1080 if kind == "socks5" else 8080)
+        return (
+            kind,
+            parsed.hostname,
+            int(port),
+            unquote(parsed.username) if parsed.username else "",
+            unquote(parsed.password) if parsed.password else "",
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def _build_opener(proxy_url: str | None = None) -> urllib.request.OpenerDirector:
+    """按代理配置造 opener。
+
+    proxy_url 为 None 表示用 TG_PROXY；传 "" 表示强制直连（自检用）。
+    """
+    raw = TG_PROXY if proxy_url is None else proxy_url
+    spec = _parse_proxy(raw)
+    # 显式清空：容器环境里常带 http_proxy，不清空会连到不该去的地方；
+    # SOCKS 分支也一样——留着它，环境变量里的代理会盖掉我们的设置。
+    no_env_proxy = urllib.request.ProxyHandler({})
+    if not spec:
+        return urllib.request.build_opener(no_env_proxy)
+
+    kind, host, port, user, password = spec
+    if kind == "socks5":
+        return urllib.request.build_opener(no_env_proxy, _SocksProxyHandler(spec))
+
+    cred = f"{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@" if user else ""
+    url = f"http://{cred}{host}:{port}"
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": url, "https": url})
+    )
+
+
+USER_AGENT = "tg-ai-bot/1.0"
+
+# 默认 opener 只造一次；代理配置是启动期固定的，改了要重启容器
+_opener = _build_opener()
+
+_lock = threading.RLock()
+# bot_id -> 运行时（线程、停止信号、状态、最近消息）
+_runtimes: dict[int, dict[str, Any]] = {}
+
+DEFAULT_RUNTIME_KEY = 0
+
+# 每个会话的上次回复时间，用于最小间隔限流（按机器人分开，避免互相影响）
+_last_reply: dict[tuple[int, str], float] = {}
+
+
+class BotError(RuntimeError):
+    """Bot API 相关错误，message 直接面向用户展示。"""
+
+
+def _api(method: str, token: str, payload: dict[str, Any] | None = None, timeout: int = 65) -> Any:
+    if not token:
+        raise BotError("请先填写 Bot Token（在 @BotFather 用 /newbot 获取）")
+    url = f"{API_ROOT}/bot{token}/{method}"
+    data = None
+    headers = {"User-Agent": USER_AGENT}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with _opener.open(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            raise BotError(f"Bot API 返回 HTTP {exc.code}：{raw[:200]}") from exc
+    except urllib.error.URLError as exc:
+        raise BotError(f"无法连接 Telegram Bot API：{exc.reason}") from exc
+    except TimeoutError as exc:
+        raise BotError("请求 Bot API 超时") from exc
+
+    if not body.get("ok"):
+        desc = body.get("description") or "未知错误"
+        if "Unauthorized" in desc:
+            raise BotError("Bot Token 无效或已被吊销，请在 @BotFather 重新获取")
+        raise BotError(desc)
+    return body.get("result")
+
+
+# ---------------- 配置读取 ----------------
+
+# 老版本只有一条机器人配置，存在 settings 里。升级后这条记录被搬进 bots 表，
+# 但如果用户没迁移过（比如刚 reset 库），这里仍然要能读出来，所以保留回落。
+
+def _cfg() -> dict[str, str]:
+    return db.get_settings()
+
+
+def _record(bot_id: int | None = None) -> dict[str, Any] | None:
+    """取机器人记录：指定优先，否则默认机器人，再否则老 settings 里的单机器人。"""
+    if bot_id:
+        found = db.get_bot(int(bot_id))
+        if found:
+            return found
+    found = db.default_bot()
+    if found:
+        return found
+    # 一个机器人记录都没有时，退回老的单机器人配置（可能连 token 都还没填）
+    return {
+        "id": DEFAULT_RUNTIME_KEY,
+        "name": db.get_setting("bot_username", "") or "默认机器人",
+        "token": str(db.get_setting("bot_token", "")).strip(),
+        "username": db.get_setting("bot_username", ""),
+        "enabled": db.get_setting("bot_enabled", "0") == "1",
+        "trigger": db.get_setting("bot_trigger", "mention"),
+        "update_offset": db.get_setting("bot_update_offset", "0"),
+        "business_connections": db.get_setting("business_connections", ""),
+        "known_chats": db.get_setting("known_chats", ""),
+    }
+
+
+_SETTING_ALIASES = {
+    "username": "bot_username",
+    "enabled": "bot_enabled",
+    "trigger": "bot_trigger",
+    "update_offset": "bot_update_offset",
+}
+
+
+def _persist(record: dict[str, Any], **fields: Any) -> None:
+    """写回机器人字段；老的单机器人配置落到 settings。"""
+    rid = int(record.get("id") or 0)
+    if rid and db.get_bot(rid):
+        db.update_bot(rid, fields)
+        return
+    for key, value in fields.items():
+        if key == "enabled":
+            db.set_setting("bot_enabled", "1" if value else "0")
+            continue
+        db.set_setting(_SETTING_ALIASES.get(key, key), str(value))
+
+
+def enabled(bot_id: int | None = None) -> bool:
+    record = _record(bot_id)
+    return bool(record and record.get("enabled"))
+
+
+def _trigger_mode(bot_id: int | None = None) -> str:
+    record = _record(bot_id) or {}
+    mode = str(record.get("trigger") or "mention")
+    return mode if mode in ("mention", "all", "private") else "mention"
+
+
+def token_of(bot_id: int | None = None) -> str:
+    record = _record(bot_id)
+    return str((record or {}).get("token") or "").strip()
+
+
+# ---------------- 运行时（每个机器人一份） ----------------
+
+def _runtime(bot_id: int | None = None) -> dict[str, Any]:
+    """取（必要时创建）某个机器人的运行时容器。"""
+    key = int(bot_id or DEFAULT_RUNTIME_KEY)
+    with _lock:
+        rt = _runtimes.get(key)
+        if rt is None:
+            rt = {
+                "id": key,
+                "thread": None,
+                "stop": None,
+                "recent_lock": threading.RLock(),
+                "recent": {},
+                "state": {
+                    "running": False,
+                    "last_error": "",
+                    "last_poll": "",
+                    "replies": 0,
+                    "bot_name": "",
+                    "bot_username": "",
+                    "started_at": "",
+                    "business_replies": 0,
+                },
+            }
+            _runtimes[key] = rt
+        return rt
+
+
+def _state_of(bot_id: int | None = None) -> dict[str, Any]:
+    return _runtime(bot_id)["state"]
+
+
+# ---------------- 出网体检 ----------------
+
+def _probe(url: str, proxy_url: str, timeout: int = 12) -> dict[str, Any]:
+    """打一次 HEAD/GET，只回报「通不通、多快、错在哪」。"""
+    started = time.time()
+    opener = _build_opener(proxy_url)
+    try:
+        request = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+        with opener.open(request, timeout=timeout) as response:
+            return {
+                "ok": True,
+                "status": response.status,
+                "ms": int((time.time() - started) * 1000),
+            }
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx 也算「网络通了」——说明 DNS 和 TCP 都没问题，是应用层的事
+        return {
+            "ok": exc.code < 500,
+            "status": exc.code,
+            "ms": int((time.time() - started) * 1000),
+            "error": "" if exc.code < 500 else f"HTTP {exc.code}",
+        }
+    except Exception as exc:  # noqa: BLE001 - 自检要把所有异常都翻成人话
+        detail = getattr(exc, "reason", exc)
+        return {
+            "ok": False,
+            "status": 0,
+            "ms": int((time.time() - started) * 1000),
+            "error": str(detail)[:200],
+        }
+
+
+def diagnose() -> dict[str, Any]:
+    """出网体检：分别验「直连」「代理」「当前生效的根地址」。
+
+    部署在只允许出网、不允许入网的环境（家用 NAS、公司内网）时，
+    面板上最能说清楚问题的就是这一步：到底连不上 Telegram，还是 token 不对。
+    """
+    proxy_spec = _parse_proxy(TG_PROXY)
+    proxy_label = ""
+    if proxy_spec:
+        kind, host, port, user, _ = proxy_spec
+        proxy_label = f"{kind}://{host}:{port}" + (f"（账号 {user}）" if user else "")
+
+    direct = _probe(f"{API_ROOT}/", "")
+    proxied = _probe(f"{API_ROOT}/", TG_PROXY) if TG_PROXY else None
+    effective = proxied if (TG_PROXY and proxied and proxied.get("ok")) else direct
+
+    hint = ""
+    if effective.get("ok"):
+        hint = "出网正常，可以校验 Bot Token 了"
+    elif not TG_PROXY:
+        hint = (
+            "连不上 Telegram。这个网络需要代理：在 .env 里填 TG_PROXY="
+            "http://代理IP:端口（或 socks5://代理IP:端口），然后重启容器。"
+        )
+    elif proxied and not proxied.get("ok"):
+        hint = (
+            f"代理 {proxy_label} 也连不上。先在 NAS 终端里试 "
+            f"curl -x {proxy_label.split('（')[0]} https://api.telegram.org —— "
+            "如果这条也不通，是代理本身的问题；如果这条通、面板不通，把代理协议换一种再试。"
+        )
+
+    return {
+        "ok": bool(effective.get("ok")),
+        "api_root": API_ROOT,
+        "proxy": proxy_label,
+        "proxy_configured": bool(proxy_spec),
+        "direct": direct,
+        "proxied": proxied,
+        "effective": "proxy" if (TG_PROXY and proxied and proxied.get("ok")) else "direct",
+        "hint": hint,
+    }
+
+
+# ---------------- Token 校验 ----------------
+
+def verify_token(token: str | None = None, bot_id: int | None = None) -> dict[str, Any]:
+    """调用 getMe 校验 token，并把机器人信息写回记录（或老配置）。"""
+    record = _record(bot_id) if bot_id else None
+    token = (token or str((record or {}).get("token") or "")).strip() or db.get_setting("bot_token", "").strip()
+    me = _api("getMe", token, timeout=20)
+    username = me.get("username") or ""
+    name = " ".join(
+        x for x in (me.get("first_name"), me.get("last_name")) if x
+    ) or username
+    target = record or _record()
+    if target:
+        _persist(target, username=username, name=target.get("name") or name)
+    else:
+        db.set_setting("bot_username", username)
+    state = _state_of(bot_id)
+    with _lock:
+        state["bot_name"] = name
+        state["bot_username"] = username
+    return {
+        "ok": True,
+        "id": me.get("id"),
+        "name": name,
+        "username": username,
+        "can_join_groups": me.get("can_join_groups"),
+        "can_read_all_group_messages": me.get("can_read_all_group_messages"),
+        "can_connect_to_business": me.get("can_connect_to_business"),
+    }
+
+
+# ---------------- AI 调用 ----------------
+
+def _agent_cfg(agent: dict[str, Any] | None) -> dict[str, str]:
+    """把智能体记录摊平成和老配置同名的字段，没绑智能体时就用老配置。"""
+    cfg = dict(_cfg())
+    if not agent:
+        return cfg
+    mapping = {
+        "ai_base_url": agent.get("base_url"),
+        "ai_api_key": agent.get("api_key"),
+        "ai_model": agent.get("model"),
+        "ai_system_prompt": agent.get("system_prompt"),
+        "ai_temperature": agent.get("temperature"),
+        "ai_max_tokens": agent.get("max_tokens"),
+        "ai_history_len": agent.get("history_len"),
+        "ai_min_interval": agent.get("min_interval"),
+        "ai_proxy": agent.get("proxy"),
+    }
+    for key, value in mapping.items():
+        if value not in (None, ""):
+            cfg[key] = str(value)
+    return cfg
+
+
+def _self_identity(agent: dict[str, Any] | None) -> str:
+    """机器人的自我认知：把名字写进系统提示，让模型记住并自称这个名字。
+
+    命名后模型才知道「我叫什么」，别人问起时能如实回答，而不是自称 AI 助手
+    或大模型。账号自动回复（bot_id=-1）是「以你本人身份说话」，不走这里。
+    """
+    name = str((agent or {}).get("name") or "").strip()
+    if not name or name in ("未命名智能体", "默认机器人"):
+        return ""
+    return (
+        f"你的名字叫「{name}」。"
+        "当别人问你是谁、你叫什么名字、你叫什么时，要如实回答这个名字，"
+        "不要自称 AI 助手、大模型、语言模型或任何其他身份。"
+    )
+
+
+def _ai_messages(
+    chat_id: str,
+    user_text: str,
+    author: str,
+    is_private: bool,
+    bot_id: int | None = None,
+    agent: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    if agent is None:
+        agent = db.agent_for_bot(bot_id)
+    cfg = _agent_cfg(agent)
+    system = (cfg.get("ai_system_prompt") or "").strip()
+    messages: list[dict[str, str]] = []
+    # 自我认知放最前，比人设提示词优先级更高：命名了就得一直记得自己叫什么
+    if bot_id != -1:
+        identity = _self_identity(agent)
+        if identity:
+            messages.append({"role": "system", "content": identity})
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    # 长期记忆：跨天、跨会话都还在的那部分；按当前这句话挑相关的几条注入
+    try:
+        agent_id = int(agent["id"]) if agent and agent.get("id") is not None else 0
+        max_notes = int(cfg.get("memory_max_notes", db.get_setting("memory_max_notes", "8")) or 8)
+    except (TypeError, ValueError):
+        agent_id, max_notes = 0, 8
+    recalled = memory.context(agent_id, chat_id, author, user_text, limit=max_notes)
+    if recalled:
+        messages.append({"role": "system", "content": recalled})
+
+    try:
+        history_len = max(0, min(int(cfg.get("ai_history_len", "12")), 40))
+    except ValueError:
+        history_len = 12
+    # 老配置没有 agent 维度时按 bot 存；有 agent 时按 agent 存，换机器人的同一智能体也能接上前文
+    scope_id = int(agent["id"]) if agent and agent.get("id") is not None else (bot_id or 0)
+    for item in db.ai_history(chat_id, history_len, bot_id=scope_id):
+        role = item.get("role")
+        content = str(item.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if role == "user" and item.get("author") and not is_private:
+            content = f"{item['author']}：{content}"
+        messages.append({"role": role, "content": content})
+
+    prefix = "" if is_private else f"{author}："
+    messages.append({"role": "user", "content": prefix + user_text})
+    return messages
+
+
+def normalize_base(base_url: str) -> str:
+    """把用户填的接口地址收拾成「到 /v1 为止」的形态。
+
+    面板上最常见的两种填法都会出问题：整段粘成 .../v1/chat/completions，
+    或者多带一层 .../v1/models。这里统一剥掉，只留服务根路径。
+    """
+    base = (base_url or "").strip().rstrip("/")
+    # 有人会把整条请求地址贴进来，逐层剥掉尾部端点
+    for suffix in ("/chat/completions", "/completions", "/models", "/embeddings", "/responses"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+    return base
+
+
+def _is_retryable(status: int) -> bool:
+    """429 与 5xx 属于暂时性故障，重试有意义；4xx 其他情况重试也没用。"""
+    return status == 429 or 500 <= status < 600
+
+
+def _retry_after(exc: urllib.error.HTTPError) -> float:
+    raw = (exc.headers or {}).get("Retry-After", "") if exc.headers else ""
+    try:
+        return max(0.0, min(float(str(raw).strip()), 8.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rate_limit_hint(detail: str) -> str:
+    """把各家五花八门的限流报文翻成一句人话。"""
+    lowered = detail.lower()
+    if "tpm" in lowered or ("token" in lowered and "limit" in lowered):
+        return "接口限流（429）：这一分钟的 token 用量超了。等 1 分钟再试，或把「最大回复长度」调小、换用量更宽松的模型。"
+    if "rpm" in lowered or "request" in lowered:
+        return "接口限流（429）：这一分钟的请求次数超了。等 1 分钟再试，或换用量更宽松的模型。"
+    return "接口限流（429）：调用太频繁了。等 1 分钟再试，或换一个额度更大的模型。"
+
+
+def call_ai(messages: list[dict[str, str]], agent: dict[str, Any] | None = None) -> str:
+    """调用兼容 OpenAI 接口的 chat/completions。agent 为空时用全局老配置。"""
+    cfg = _agent_cfg(agent)
+    base = normalize_base(cfg.get("ai_base_url") or "")
+    key = (cfg.get("ai_api_key") or "").strip()
+    model = (cfg.get("ai_model") or "").strip()
+    if not base:
+        raise BotError("请填写 AI 接口地址（例如 https://api.deepseek.com/v1）")
+    if not key:
+        raise BotError("请填写 AI API Key")
+    if not model:
+        raise BotError("请填写模型名（例如 deepseek-chat）")
+
+    url = f"{base}/chat/completions"
+    try:
+        url = security.guard_outbound(url)
+    except security.SecurityError as exc:
+        raise BotError(str(exc)) from exc
+    try:
+        max_tokens = max(64, min(int(cfg.get("ai_max_tokens", "800")), 4096))
+        temperature = max(0.0, min(float(cfg.get("ai_temperature", "0.7")), 2.0))
+    except ValueError:
+        max_tokens, temperature = 800, 0.7
+
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
+    ).encode("utf-8")
+
+    # 配置了代理就走代理，否则直连（容器内环境变量常带代理，直连必须显式清空）
+    ai_proxy = (cfg.get("ai_proxy") or "").strip()
+    opener = _build_opener(ai_proxy) if ai_proxy else _opener
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    # 两件事都要重试：跨境链路被重置（网络层），以及接口限流 / 临时 5xx（应用层）。
+    # 免费额度的 429 绝大多数是「每分钟」窗口，退避几秒往往就过了。
+    last_net_error: Exception | None = None
+    last_http_error: tuple[int, str] | None = None
+    body: Any = None
+    delays = [1.5, 4.0]
+    for attempt in range(3):
+        try:
+            with opener.open(request, timeout=90) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            last_net_error = None
+            last_http_error = None
+            break
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            if exc.code == 401:
+                raise BotError("AI 接口鉴权失败，请检查 API Key") from exc
+            if exc.code == 404:
+                raise BotError(
+                    f"AI 接口地址或模型名有误（HTTP 404）：{raw[:200]}。"
+                    "确认 base_url 填到 /v1 为止、模型名拼写正确。"
+                ) from exc
+            if exc.code == 402:
+                raise BotError(f"账户余额不足（HTTP 402）：{raw[:160]}") from exc
+            last_http_error = (exc.code, raw)
+            last_net_error = None
+            if not _is_retryable(exc.code) or attempt == 2:
+                break
+            # 429 的上游常带 Retry-After，按它等更准；continue 跳过下面的通用退避
+            time.sleep(max(delays[attempt], _retry_after(exc)))
+            continue
+        except urllib.error.URLError as exc:
+            last_net_error = exc
+            last_http_error = None
+        except (TimeoutError, ConnectionResetError) as exc:
+            last_net_error = exc
+            last_http_error = None
+        if attempt < 2:
+            time.sleep(delays[attempt])
+
+    if last_http_error is not None:
+        code, raw = last_http_error
+        if code == 429:
+            raise BotError(_rate_limit_hint(raw))
+        raise BotError(f"AI 接口返回 HTTP {code}：{raw[:200]}")
+
+    if last_net_error is not None:
+        reason = getattr(last_net_error, "reason", last_net_error)
+        detail = str(reason)
+        if "timed out" in detail.lower() or "reset" in detail.lower():
+            raise BotError(
+                f"无法连接 AI 接口：{detail}。这个地址在当前网络下不可达，"
+                "常见原因是接口（或中转）只对大陆网络开放；部署在境外云主机时会被墙/被拒。"
+                "请换用全球可达的服务，例如 https://api.deepseek.com/v1、"
+                "https://api.siliconflow.cn/v1 或 https://openrouter.ai/api/v1。"
+            )
+        raise BotError(f"无法连接 AI 接口：{detail}")
+
+    try:
+        text = body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise BotError(f"AI 返回格式不符合预期：{str(body)[:200]}") from exc
+    return str(text or "").strip()
+
+
+def test_ai(agent: dict[str, Any] | None = None) -> dict[str, Any]:
+    """用一句最短的话验证 AI 配置是否可用。"""
+    started = time.time()
+    text = call_ai([{"role": "user", "content": "只回复两个字：可用"}], agent=agent)
+    return {"ok": True, "reply": text[:200], "ms": int((time.time() - started) * 1000)}
+
+
+def _model_names(data: Any) -> list[str]:
+    """从各家 /models 的返回里挖出模型名。
+
+    见过这些形状：{"data":[{"id":...}]}、{"models":[...]}、{"result":[...]}、
+    {"data":{"data":[...]}}、以及直接给一个数组。都兼容一下，省得用户以为接口坏了。
+    """
+    candidates: list[Any] = []
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        for key in ("data", "models", "result", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+            if isinstance(value, dict):
+                for inner in ("data", "models", "result", "items"):
+                    if isinstance(value.get(inner), list):
+                        candidates = value[inner]
+                        break
+                if candidates:
+                    break
+
+    names: list[str] = []
+    for item in candidates:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            name = str(
+                item.get("id") or item.get("name") or item.get("model") or ""
+            ).strip()
+        else:
+            name = ""
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def list_models(base_url: str, api_key: str, proxy: str = "") -> dict[str, Any]:
+    """读 OpenAI 兼容接口的 /models，让面板直接把可选模型列出来。"""
+    base = normalize_base(base_url)
+    key = (api_key or "").strip()
+    if not base:
+        raise BotError("先填接口地址（例如 https://api.deepseek.com/v1）")
+    if not base.startswith(("http://", "https://")):
+        raise BotError("接口地址要以 http:// 或 https:// 开头")
+    if not key:
+        raise BotError("先填 API Key，读取模型列表要用它鉴权")
+    url = f"{base}/models"
+    try:
+        url = security.guard_outbound(url)
+    except security.SecurityError as exc:
+        raise BotError(str(exc)) from exc
+
+    proxy = (proxy or "").strip()
+    opener = _build_opener(proxy) if proxy else _opener
+
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    raw = ""
+    for attempt in range(2):
+        try:
+            with opener.open(request, timeout=25) as response:
+                raw = response.read().decode("utf-8", "replace")
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            if exc.code in (401, 403):
+                raise BotError("鉴权失败，Key 可能不对或没开通权限") from exc
+            if exc.code == 404:
+                raise BotError(
+                    "这个地址没有 /models 接口（HTTP 404）。确认 base_url 填到 /v1 为止，"
+                    "例如 https://api.deepseek.com/v1；模型名手动填也一样能用"
+                ) from exc
+            if exc.code == 429:
+                if attempt == 0:
+                    time.sleep(max(1.5, _retry_after(exc)))
+                    continue
+                raise BotError(_rate_limit_hint(detail)) from exc
+            raise BotError(f"读取模型失败（HTTP {exc.code}）：{detail}") from exc
+        except urllib.error.URLError as exc:
+            raise BotError(f"连不上接口：{getattr(exc, 'reason', exc)}") from exc
+        except (TimeoutError, ConnectionResetError) as exc:
+            raise BotError(f"连接接口超时或被重置：{exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise BotError(f"接口返回的不是 JSON，可能是把网页地址填成了 base_url：{raw[:120]}") from exc
+
+    models = _model_names(data)
+    if not models:
+        raise BotError("接口没返回任何模型，可能这把 Key 下没有可用模型，或服务没有实现 /models")
+    models.sort()
+    return {"ok": True, "models": models, "count": len(models), "endpoint": url}
+
+
+# ---------------- 消息处理 ----------------
+
+def _chat_title(message: dict[str, Any]) -> str:
+    chat = message.get("chat") or {}
+    return (
+        chat.get("title")
+        or " ".join(
+            x for x in (chat.get("first_name"), chat.get("last_name")) if x
+        )
+        or chat.get("username")
+        or str(chat.get("id", ""))
+    )
+
+
+def _author(message: dict[str, Any]) -> str:
+    sender = message.get("from") or {}
+    return (
+        " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+        or sender.get("username")
+        or str(sender.get("id", "某人"))
+    )
+
+
+def _should_reply(message: dict[str, Any], bot_username: str, bot_id: int | None = None) -> tuple[bool, str]:
+    """判断这条消息要不要回。返回 (是否回复, 去掉 @ 之后的文本)。"""
+    chat = message.get("chat") or {}
+    chat_type = chat.get("type")
+    text = (message.get("text") or "").strip()
+    if not text:
+        return False, ""
+    # 忽略机器人自己和其他机器人
+    sender = message.get("from") or {}
+    if sender.get("is_bot"):
+        return False, ""
+
+    is_private = chat_type == "private"
+    mode = _trigger_mode(bot_id)
+    if is_private:
+        return True, text
+    if mode == "private":
+        return False, ""
+
+    mentions_me = False
+    if bot_username:
+        mentions_me = f"@{bot_username}".lower() in text.lower()
+    replied_to_me = False
+    reply = message.get("reply_to_message") or {}
+    if reply:
+        reply_sender = reply.get("from") or {}
+        replied_to_me = bool(bot_username) and (
+            str(reply_sender.get("username") or "").lower() == bot_username.lower()
+        )
+
+    if mode == "all":
+        return True, text
+    if mentions_me or replied_to_me:
+        cleaned = text
+        if bot_username:
+            cleaned = cleaned.replace(f"@{bot_username}", "").replace(
+                f"@{bot_username.lower()}", ""
+            )
+        return True, cleaned.strip() or text
+    return False, ""
+
+
+# ---------------- Business（秘书模式）----------------
+#
+# Telegram Business 允许把机器人绑定到用户账号，让它代表用户回复私聊。
+# 这条链路不需要 api_id：机器人读 business_message，回复时带上
+# business_connection_id，消息就以「用户本人」的身份出现在对方会话里。
+#
+# 关键坑：用户自己发的消息也会以 business_message 回显，如果不按 owner_id
+# 过滤，AI 会对着自己的回复再回一次，形成死循环。
+
+def business_connections(bot_id: int | None = None) -> dict[str, Any]:
+    """已绑定的 Business 连接，key 是 business_connection_id。"""
+    record = _record(bot_id) or {}
+    raw = str(record.get("business_connections") or "") or db.get_setting("business_connections", "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_business_connection(conn: dict[str, Any], bot_id: int | None = None) -> None:
+    conn_id = str(conn.get("id") or "")
+    if not conn_id:
+        return
+    user = conn.get("user") or {}
+    data = business_connections(bot_id)
+    data[conn_id] = {
+        "owner_id": user.get("id"),
+        "owner_name": " ".join(
+            x for x in (user.get("first_name"), user.get("last_name")) if x
+        ) or user.get("username") or "",
+        "owner_username": user.get("username") or "",
+        "is_enabled": bool(conn.get("is_enabled")),
+        "can_reply": bool(conn.get("can_reply")),
+        "user_chat_id": conn.get("user_chat_id"),
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    record = _record(bot_id)
+    if record and record.get("id"):
+        db.update_bot(int(record["id"]), {"business_connections": json.dumps(data, ensure_ascii=False)})
+    db.set_setting("business_connections", json.dumps(data, ensure_ascii=False))
+    with _lock:
+        _state_of(bot_id)["business"] = list(data.values())
+
+
+def _handle_business_connection(conn: dict[str, Any], bot_id: int | None = None) -> None:
+    _save_business_connection(conn, bot_id)
+    name = (conn.get("user") or {}).get("first_name") or "用户"
+    state = "已启用" if conn.get("is_enabled") else "已停用"
+    log.info("Business 连接更新：%s %s", name, state)
+
+
+def _business_owner_id(connection_id: str, bot_id: int | None = None) -> Any:
+    info = business_connections(bot_id).get(connection_id) or {}
+    return info.get("owner_id")
+
+
+def is_own_business_message(message: dict[str, Any], bot_id: int | None = None) -> bool:
+    """判断这条 business 消息是不是账号主人自己发的（含我们自己的回复回显）。"""
+    conn_id = message.get("business_connection_id")
+    if not conn_id:
+        return False
+    owner_id = _business_owner_id(conn_id, bot_id)
+    sender_id = (message.get("from") or {}).get("id")
+    return owner_id is not None and sender_id == owner_id
+
+
+def _ensure_business_connection(connection_id: str, bot_id: int | None = None) -> None:
+    """本地缓存里没有这个连接时，向 Bot API 取回来。
+
+    容器没有持久卷，重建后 business_connections 是空的；不知道 owner_id 就
+    分不清「对方发的」和「自己回显的」，会让 AI 自问自答。所以必须按需补齐。
+    """
+    if not connection_id or connection_id in business_connections(bot_id):
+        return
+    token = token_of(bot_id)
+    if not token:
+        return
+    try:
+        conn = _api(
+            "getBusinessConnection",
+            token,
+            {"business_connection_id": connection_id},
+        )
+    except BotError as exc:
+        log.warning("取回 Business 连接 %s 失败：%s", connection_id, exc)
+        return
+    if isinstance(conn, dict):
+        _save_business_connection(conn, bot_id)
+
+
+def _reply(
+    chat_id: Any,
+    text: str,
+    reply_to: int | None,
+    business_connection_id: str | None = None,
+    bot_id: int | None = None,
+) -> None:
+    token = token_of(bot_id)
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:4000]}
+    if business_connection_id:
+        # 带上这个参数，消息才会以账号主人的身份发出
+        payload["business_connection_id"] = business_connection_id
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    try:
+        _api("sendMessage", token, payload)
+    except BotError as exc:
+        log.warning("回复失败：%s", exc)
+        raise
+
+
+def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
+    agent = db.agent_for_bot(bot_id)
+    cfg = _agent_cfg(agent)
+    record = _record(bot_id) or {}
+    bot_username = str(record.get("username") or "").strip()
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    state = _state_of(bot_id)
+
+    # Business 模式下，账号主人自己的消息会回显，必须跳过，否则自问自答死循环
+    biz = message.get("business_connection_id")
+    if biz:
+        _ensure_business_connection(biz, bot_id)
+        if is_own_business_message(message, bot_id):
+            return
+        if _business_owner_id(biz, bot_id) is None:
+            # 拿不到 owner 就分不清是谁发的，宁可这条不回，也不能冒死循环的风险
+            log.warning("Business 连接 %s 的 owner 未知，跳过该消息", biz)
+            return
+
+    should, text = _should_reply(message, bot_username, bot_id)
+    if not should:
+        return
+
+    try:
+        min_interval = max(0.0, min(float(cfg.get("ai_min_interval", "3")), 60))
+    except ValueError:
+        min_interval = 3.0
+
+    key = (int(bot_id or DEFAULT_RUNTIME_KEY), str(chat_id))
+    now = time.time()
+    if min_interval and now - _last_reply.get(key, 0) < min_interval:
+        log.info("会话 %s 距上次回复不足 %.0f 秒，跳过", chat_id, min_interval)
+        return
+
+    title = _chat_title(message)
+    author = _author(message)
+    is_private = chat.get("type") == "private"
+    storage_id = str(chat_id)
+    # 有智能体就按智能体存对话和记忆，换机器人接手同一智能体也能接上前文
+    scope_id = int(agent["id"]) if agent and agent.get("id") is not None else (bot_id or 0)
+    db.add_ai_message(storage_id, title, "user", author, text, bot_id=scope_id)
+
+    try:
+        messages = _ai_messages(storage_id, text, author, is_private, bot_id, agent)
+        answer = call_ai(messages, agent=agent) or "（模型没有返回内容）"
+    except BotError as exc:
+        log.warning("AI 调用失败：%s", exc)
+        # 同步到面板状态，否则用户只能翻容器日志才知道为什么没回复
+        state["last_error"] = f"AI 调用失败：{exc}"
+        try:
+            _reply(chat_id, f"AI 暂时不可用：{exc}", message.get("message_id"), biz, bot_id)
+        except BotError:
+            pass
+        return
+
+    db.add_ai_message(storage_id, title, "assistant", "bot", answer, bot_id=scope_id)
+    memory.learn_async(scope_id, storage_id, title, author, text, answer, agent=agent)
+    if state["last_error"].startswith("AI 调用失败"):
+        state["last_error"] = ""
+    try:
+        _reply(chat_id, answer, message.get("message_id"), biz, bot_id)
+    except BotError:
+        return
+
+    _last_reply[key] = time.time()
+    with _lock:
+        state["replies"] = int(state.get("replies", 0)) + 1
+        if biz:
+            state["business_replies"] = int(state.get("business_replies", 0)) + 1
+
+
+# ---------------- 轮询循环 ----------------
+
+def _poll_loop(stop: threading.Event, bot_id: int | None = None) -> None:
+    rt = _runtime(bot_id)
+    state = rt["state"]
+    backoff = 2.0
+    while not stop.is_set():
+        if not enabled(bot_id):
+            stop.wait(5)
+            continue
+        token = token_of(bot_id)
+        if not token:
+            stop.wait(5)
+            continue
+
+        record = _record(bot_id) or {}
+        try:
+            offset = int(str(record.get("update_offset") or "0") or 0)
+        except ValueError:
+            offset = 0
+
+        with _lock:
+            state["last_poll"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            updates = _api(
+                "getUpdates",
+                token,
+                {
+                    "offset": offset,
+                    "timeout": 50,
+                    "allowed_updates": [
+                        "message",
+                        "my_chat_member",
+                        "business_connection",
+                        "business_message",
+                    ],
+                },
+                timeout=70,
+            )
+            backoff = 2.0
+            with _lock:
+                state["last_error"] = ""
+        except BotError as exc:
+            with _lock:
+                state["last_error"] = str(exc)
+            log.warning("拉取更新失败（机器人 %s）：%s", bot_id, exc)
+            # token 无效时不要疯跑，退避等待
+            stop.wait(min(backoff, 60))
+            backoff = min(backoff * 2, 60)
+            continue
+
+        for update in updates or []:
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                fresh = _record(bot_id) or {}
+                _persist(fresh, update_offset=str(update_id + 1))
+            try:
+                member = update.get("my_chat_member")
+                if member:
+                    # 机器人被拉进群 / 被踢出群：记下群信息，面板可选
+                    remember_chat(member.get("chat") or {}, bot_id)
+                    continue
+                conn = update.get("business_connection")
+                if conn:
+                    _handle_business_connection(conn, bot_id)
+                    continue
+                # business_message 是「以用户身份」收发的私聊消息
+                message = update.get("message") or update.get("business_message") or {}
+                if not message:
+                    continue
+                _handle_message(message, bot_id)
+            except Exception as exc:  # 单条消息出错不能拖垮整个循环
+                log.exception("处理消息异常：%s", exc)
+
+        if not updates:
+            # 长轮询本身会阻塞，这里只是兜底，避免空转
+            stop.wait(1)
+
+
+def _start_one(bot_id: int | None = None) -> None:
+    rt = _runtime(bot_id)
+    if not token_of(bot_id) or not enabled(bot_id):
+        with _lock:
+            rt["state"]["running"] = False
+        return
+    with _lock:
+        thread = rt.get("thread")
+        if thread is not None and thread.is_alive():
+            return
+        stop = threading.Event()
+        rt["stop"] = stop
+        rt["thread"] = threading.Thread(
+            target=_poll_loop, args=(stop, bot_id),
+            name=f"bot-poll-{bot_id or DEFAULT_RUNTIME_KEY}", daemon=True,
+        )
+        rt["state"]["running"] = True
+        rt["state"]["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    rt["thread"].start()
+    log.info("机器人 %s 轮询线程已启动", bot_id)
+
+
+def _stop_one(bot_id: int | None = None) -> None:
+    rt = _runtime(bot_id)
+    with _lock:
+        stop = rt.get("stop")
+        if stop is not None:
+            stop.set()
+        rt["thread"] = None
+        rt["stop"] = None
+        rt["state"]["running"] = False
+
+
+def start(bot_id: int | None = None) -> None:
+    """启动轮询：不传 bot_id 就把当前所有启用的机器人全部拉起来。"""
+    if bot_id:
+        _start_one(bot_id)
+        return
+    records = db.list_bots()
+    if records:
+        for item in records:
+            _start_one(item.get("id"))
+        return
+    # 老配置（没有 bots 表记录）仍按单机器人跑
+    _start_one(None)
+
+
+def stop(bot_id: int | None = None) -> None:
+    if bot_id:
+        _stop_one(bot_id)
+        return
+    with _lock:
+        keys = list(_runtimes.keys())
+    for key in keys:
+        _stop_one(None if key == DEFAULT_RUNTIME_KEY else key)
+    _last_reply.clear()
+
+
+def restart(bot_id: int | None = None) -> None:
+    stop(bot_id)
+    start(bot_id)
+
+
+def _status_one(bot_id: int | None = None) -> dict[str, Any]:
+    rt = _runtime(bot_id)
+    snapshot = dict(rt["state"])
+    record = _record(bot_id) or {}
+    agent = db.agent_for_bot(record.get("id") or bot_id)
+    cfg = _agent_cfg(agent)
+    token = str(record.get("token") or "").strip()
+    thread = rt.get("thread")
+    return {
+        "id": record.get("id"),
+        "name": record.get("name") or "",
+        "enabled": bool(record.get("enabled")),
+        "running": bool(snapshot["running"] and thread is not None and thread.is_alive()),
+        "token_set": bool(token),
+        "bot_name": snapshot.get("bot_name") or record.get("username") or "",
+        "bot_username": snapshot.get("bot_username") or record.get("username") or "",
+        "trigger": _trigger_mode(bot_id),
+        "last_poll": snapshot.get("last_poll", ""),
+        "last_error": snapshot.get("last_error", ""),
+        "replies": snapshot.get("replies", 0),
+        "business_replies": snapshot.get("business_replies", 0),
+        "business": list(business_connections(bot_id).values()),
+        "started_at": snapshot.get("started_at", ""),
+        "chats": known_chats(bot_id),
+        "stats": db.ai_stats(bot_id if bot_id else None),
+        "ai_agent_id": record.get("ai_agent_id"),
+        "ai_agent_name": (agent or {}).get("name", ""),
+        "ai_base_url": cfg.get("ai_base_url", ""),
+        "ai_model": cfg.get("ai_model", ""),
+        "ai_key_set": bool((cfg.get("ai_api_key") or "").strip()),
+        # 面板上直接能看到「出网走哪条路」，不用翻容器日志
+        "api_root": API_ROOT,
+        "proxy": (f"{_parse_proxy(TG_PROXY)[0]}://{_parse_proxy(TG_PROXY)[1]}:{_parse_proxy(TG_PROXY)[2]}"
+                  if _parse_proxy(TG_PROXY) else ""),
+    }
+
+
+def status(bot_id: int | None = None) -> dict[str, Any]:
+    """面板展示用：不传 bot_id 返回汇总（含每个机器人的明细）。"""
+    if bot_id:
+        return _status_one(bot_id)
+
+    records = db.list_bots()
+    items = [_status_one(item.get("id")) for item in records]
+    if not items:
+        items = [_status_one(None)]
+    total_replies = sum(int(i.get("replies") or 0) for i in items)
+    total_business = sum(int(i.get("business_replies") or 0) for i in items)
+    primary = items[0]
+    return {
+        **primary,
+        "id": primary.get("id"),
+        "bots": [
+            {
+                "id": i.get("id"),
+                "name": i.get("name"),
+                "username": i.get("bot_username"),
+                "enabled": i.get("enabled"),
+                "running": i.get("running"),
+                "token_set": i.get("token_set"),
+                "trigger": i.get("trigger"),
+                "last_poll": i.get("last_poll"),
+                "last_error": i.get("last_error"),
+                "replies": i.get("replies"),
+                "business": i.get("business"),
+                "business_replies": i.get("business_replies"),
+            }
+            for i in items
+        ],
+        "running": any(bool(i.get("running")) for i in items),
+        "enabled": any(bool(i.get("enabled")) for i in items),
+        "token_set": any(bool(i.get("token_set")) for i in items),
+        "replies": total_replies,
+        "business_replies": total_business,
+    }
+
+
+def bot_detail(bot_id: int) -> dict[str, Any]:
+    """面板拉某个机器人的状态时用，避免和汇总混在一起。"""
+    return _status_one(bot_id)
+
+
+def send_test_message(chat_id: str, text: str, bot_id: int | None = None) -> dict[str, Any]:
+    """从面板直接发一条消息，用来验证机器人是否在目标会话里。"""
+    token = token_of(bot_id)
+    if not str(chat_id).strip():
+        raise BotError("请填写目标会话 ID 或 @频道用户名")
+    _api("sendMessage", token, {"chat_id": str(chat_id).strip(), "text": text[:4000]})
+    return {"ok": True}
+
+
+# ---------------- 机器人待过的群 ----------------
+
+def known_chats(bot_id: int | None = None) -> list[dict[str, Any]]:
+    """机器人待过的群：面板里点一下就能复制群 ID，省得自己找。"""
+    record = _record(bot_id) or {}
+    raw = str(record.get("known_chats") or "") or db.get_setting("known_chats", "")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def remember_chat(chat: dict[str, Any], bot_id: int | None = None) -> None:
+    """机器人入群/出群时记下这个群，最新的排最前，最多留 50 个。"""
+    if (chat.get("type") or "") not in ("group", "supergroup"):
+        return
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    title = chat.get("title") or chat.get("username") or str(chat_id)
+    items = [c for c in known_chats(bot_id) if c.get("id") != chat_id]
+    items.insert(0, {"id": chat_id, "title": title, "username": chat.get("username") or ""})
+    payload = json.dumps(items[:50], ensure_ascii=False)
+    record = _record(bot_id)
+    if record and record.get("id"):
+        db.update_bot(int(record["id"]), {"known_chats": payload})
+    db.set_setting("known_chats", payload)

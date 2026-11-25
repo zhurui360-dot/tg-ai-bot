@@ -1,0 +1,12 @@
+data/
+.testdata*/
+.venv/
+venv/
+.git/
+.github/
+__pycache__/
+*.pyc
+.env
+.shots/
+.tools/
+README.md

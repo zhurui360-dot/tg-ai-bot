@@ -1,0 +1,23 @@
+# 配置里有明文 bot token 和 AI Key，绝不能进仓库
+.env
+
+# 运行时数据：sqlite 库、面板改过的配置
+data/
+.testdata*/
+.tmppanel/
+.tmpprobe/
+
+# 本地验收脚本与截图（.shots 里是 CDP 脚本和 png）
+.shots/
+.tools/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 编辑器 / 系统垃圾
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,34 @@
+services:
+  tg-ai-bot:
+    build: .
+    image: tg-ai-bot:latest
+    container_name: tg-ai-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATA_DIR: /app/data
+      # 值守模式：同一套代码起两个实例时，备用实例设 STANDBY=1 只开面板、
+      # 不跑机器人。两个进程同时 getUpdates 会互相把消息抢走（Conflict）。
+      STANDBY: ${STANDBY:-}
+      # 以下都可留空，留空就用面板里保存的值。写在环境变量里的只作为首次初始值。
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      # 出网代理与 API 根地址。家宽/内网直连不了 telegram.org 时填这里，
+      # 本程序是主动拉消息的（长轮询），不需要入站端口，所以只配这两项就够。
+      TG_PROXY: ${TG_PROXY:-}
+      TG_API_ROOT: ${TG_API_ROOT:-}
+      AI_PROXY: ${AI_PROXY:-}
+    ports:
+      - "${PANEL_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

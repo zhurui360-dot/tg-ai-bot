@@ -1,0 +1,13 @@
+# 统一用 LF，避免 Windows 上 checkout 成 CRLF 后 shell 脚本在 Linux/NAS 里报
+# "bad interpreter: /bin/sh^M" —— 这类问题排查起来很浪费时间
+* text=auto eol=lf
+
+# 这两个是给容器/NAS 直接执行的，必须是 LF，不能被任何转换碰到
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf
+
+# 静态资源强制识别为文本，避免被当二进制
+*.js text
+*.css text
+*.html text
