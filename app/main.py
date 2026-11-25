@@ -193,6 +193,10 @@ def bootstrap(_: None = Depends(require_auth)) -> dict[str, Any]:
         agents_public.append(data)
     return {
         "version": __version__,
+        # 真实在跑的代码版本。__version__ 是写死的发布号，升级多少次都不会变，
+        # 拿它当「我有没有升级成功」的判断依据必然看不出变化。这里一并下发 commit。
+        "commit": updater.RUNNING_COMMIT,
+        "short_commit": updater.RUNNING_COMMIT[:8],
         "standby": STANDBY,
         "settings": {
             "timezone": settings.get("timezone", "Asia/Shanghai"),

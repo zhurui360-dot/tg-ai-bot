@@ -428,6 +428,8 @@
 
   function applyBootstrap(data) {
     state.version = data.version || "";
+    state.commit = data.commit || "";
+    state.shortCommit = data.short_commit || (state.commit ? state.commit.slice(0, 8) : "");
     state.standby = !!data.standby;
     state.settings = data.settings || {};
     state.bots = data.bots || [];
@@ -438,7 +440,13 @@
     var title = state.settings.panel_title || "TG AI 机器人";
     document.title = title;
     text("brandName", title);
-    text("verLabel", "v" + state.version + (state.standby ? " · 值守" : ""));
+    // 侧边栏挂 commit 而不是写死的发布号：升级完能一眼看出代码真的换了。
+    // 镜像内置代码没有 commit（空串），这时候退回版本号。
+    var verText = state.shortCommit
+      ? state.shortCommit
+      : "v" + state.version;
+    text("verLabel", verText + (state.standby ? " · 值守" : ""));
+    if (state.commit) $("#verLabel").title = "运行中的代码提交：" + state.commit;
     text("navBotCount", String(state.bots.length));
     text("navAgentCount", String((data.ai_agents || []).length));
 
@@ -1566,7 +1574,8 @@
     try {
       var data = await api("/api/update/status");
       state.update = data;
-      text("updVersion", "v" + (data.version || "?"));
+      // 单看 v1.0.0 永远不变，会让人以为没升级。把在跑的 commit 直接并进版本号。
+      text("updVersion", (data.short || "镜像内置") + (data.version ? " · v" + data.version : ""));
       if (data.pending_restart) {
         text("updCommit", (data.short || "镜像内置") + "（已下载 " + data.installed_short + "，待重启）");
       } else {
