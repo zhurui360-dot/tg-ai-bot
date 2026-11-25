@@ -174,6 +174,7 @@ def learn(
                 {"role": "user", "content": prompt},
             ],
             agent=agent,
+            usage_kind="learn",
         )
     except Exception as exc:  # 记忆提炼失败不能影响正常回复
         log.info("记忆提炼失败：%s", exc)

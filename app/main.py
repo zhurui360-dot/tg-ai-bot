@@ -795,6 +795,20 @@ def update_status(_: None = Depends(require_auth)) -> dict[str, Any]:
         "code_dir": str(updater.CODE_DIR),
     }
 
+# ---------------- AI 用量 ----------------
+
+@app.get("/api/usage")
+def usage(days: int = 1, _: None = Depends(require_auth)) -> dict[str, Any]:
+    """最近 N 天的调用次数与 token 用量。
+
+    上游没返回 usage 时 token 记 0，此时 unmetered 会大于 0——
+    界面必须把这种情况说清楚，否则「0 token」会被误读成「没花钱」。
+    """
+    data = db.usage_summary(days)
+    data["ok"] = True
+    return data
+
+
 # ---------------- WebDAV 备份 ----------------
 #
 # 备份只导出「配置 / 智能体 / 记忆」，不含对话记录与任何密钥。

@@ -148,6 +148,7 @@
     memory: {},
     messages: [],
     msgStats: { total: 0, today: 0, chats: 0 },
+    usage: null,
     memAgent: "",
     memScope: "",
     lastDiag: null
@@ -502,6 +503,7 @@
       loadBackupStatus();
     } else {
       loadMessages(12).then(renderDashboard).catch(function () {});
+      loadUsage().then(renderUsage);
     }
   }
 
@@ -527,6 +529,17 @@
     state.messages = data.messages || [];
     state.msgStats = data.stats || { total: 0, today: 0, chats: 0 };
     return state.messages;
+  }
+
+  async function loadUsage() {
+    try {
+      state.usage = await api("/api/usage?days=1");
+    } catch (err) {
+      // 用量只是参考信息，取不到不影响主功能
+      console.warn("用量加载失败", err);
+      state.usage = null;
+    }
+    return state.usage;
   }
 
   /* ======================================================================
@@ -574,8 +587,31 @@
     renderDashMessages();
   }
 
-  function renderDashAlert(bot, bots) {
-    var box = $("#dashAlert");
+  function renderUsage() {
+    var u = state.usage;
+    if (!u) {
+      text("stTokens", "—");
+      text("stTokensNote", "统计不可用");
+      return;
+    }
+    var tokens = num(u.total_tokens, 0);
+    text("stTokens", tokens >= 10000 ? (tokens / 1000).toFixed(1) + "k" : String(tokens));
+
+    // 上游没返回 usage 时 token 是 0。必须显式说明，否则用户会以为「没花钱」。
+    var note;
+    if (!u.calls) {
+      note = "今天还没有调用";
+    } else if (u.unmetered && u.unmetered === u.calls) {
+      note = u.calls + " 次调用，接口没返回用量";
+    } else if (u.unmetered) {
+      note = u.calls + " 次调用，" + u.unmetered + " 次未计量";
+    } else {
+      note = u.calls + " 次调用 · 均 " + Math.round(u.avg_ms / 100) / 10 + "s";
+    }
+    text("stTokensNote", note);
+  }
+
+  function renderDashAlert(bot, bots) {    var box = $("#dashAlert");
     if (!box) return;
     var alerts = [];
 

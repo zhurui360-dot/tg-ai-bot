@@ -551,8 +551,14 @@ def _rate_limit_hint(detail: str) -> str:
     return "接口限流（429）：调用太频繁了。等 1 分钟再试，或换一个额度更大的模型。"
 
 
-def call_ai(messages: list[dict[str, str]], agent: dict[str, Any] | None = None) -> str:
-    """调用兼容 OpenAI 接口的 chat/completions。agent 为空时用全局老配置。"""
+def call_ai(messages: list[dict[str, str]], agent: dict[str, Any] | None = None,
+            usage_kind: str = "chat") -> str:
+    """调用兼容 OpenAI 接口的 chat/completions。agent 为空时用全局老配置。
+
+    usage_kind 只影响用量流水里的分类（chat / learn / test），便于分清
+    「回复花的钱」和「提炼记忆花的钱」。
+    """
+    started = time.time()
     cfg = _agent_cfg(agent)
     base = normalize_base(cfg.get("ai_base_url") or "")
     key = (cfg.get("ai_api_key") or "").strip()
@@ -661,13 +667,39 @@ def call_ai(messages: list[dict[str, str]], agent: dict[str, Any] | None = None)
         text = body["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise BotError(f"AI 返回格式不符合预期：{str(body)[:200]}") from exc
+
+    # 记用量。上游返回 usage 就照实记；没返回就记 0 并标 kind=unknown，
+    # 这样「省了 token」和「上游没告诉我们」在面板上能区分开，不会假装免费。
+    usage = body.get("usage") if isinstance(body, dict) else None
+    if isinstance(usage, dict):
+        pin = int(usage.get("prompt_tokens") or 0)
+        pout = int(usage.get("completion_tokens") or 0)
+    else:
+        # 上游没返回 usage：token 记 0。汇总时「0 token 的调用数」就是没计量的部分，
+        # 这样不会把「没计量」误当「没花钱」。
+        pin = pout = 0
+    try:
+        db.add_usage(
+            agent_id=int(agent["id"]) if agent and agent.get("id") is not None else 0,
+            bot_id=0,
+            model=model,
+            kind=usage_kind,
+            prompt_tokens=pin,
+            completion_tokens=pout,
+            latency_ms=int((time.time() - started) * 1000),
+            ok=True,
+        )
+    except Exception as exc:  # 记账失败绝不能影响回复
+        log.warning("记录用量失败：%s", exc)
+
     return str(text or "").strip()
 
 
 def test_ai(agent: dict[str, Any] | None = None) -> dict[str, Any]:
     """用一句最短的话验证 AI 配置是否可用。"""
     started = time.time()
-    text = call_ai([{"role": "user", "content": "只回复两个字：可用"}], agent=agent)
+    text = call_ai([{"role": "user", "content": "只回复两个字：可用"}],
+                   agent=agent, usage_kind="test")
     return {"ok": True, "reply": text[:200], "ms": int((time.time() - started) * 1000)}
 
 
@@ -798,12 +830,47 @@ def _author(message: dict[str, Any]) -> str:
     )
 
 
+# 这些消息类型没有可读文本。不能回「我不懂」，也不能装作没看见——
+# 用户发了图，机器人完全静默，他会以为程序挂了。所以给一句明确的能力说明。
+_MEDIA_KINDS = (
+    ("photo", "图片"),
+    ("voice", "语音"),
+    ("video", "视频"),
+    ("video_note", "视频消息"),
+    ("audio", "音频"),
+    ("document", "文件"),
+    ("sticker", "贴纸"),
+    ("animation", "动图"),
+    ("location", "位置"),
+    ("contact", "名片"),
+    ("poll", "投票"),
+)
+
+
+def _media_kind(message: dict[str, Any]) -> str:
+    """消息里带的是哪种非文本内容，没有就返回空串。"""
+    for key, label in _MEDIA_KINDS:
+        if message.get(key):
+            return label
+    return ""
+
+
 def _should_reply(message: dict[str, Any], bot_username: str, bot_id: int | None = None) -> tuple[bool, str]:
-    """判断这条消息要不要回。返回 (是否回复, 去掉 @ 之后的文本)。"""
+    """判断这条消息要不要回。返回 (是否回复, 去掉 @ 之后的文本)。
+
+    媒体消息（图片/语音/文件等）也返回 True，文本部分是空的，由调用方补一句
+    能力说明。原来的写法是 `if not text: return False`，导致用户发张图提问时
+    机器人彻底静默。
+    """
     chat = message.get("chat") or {}
     chat_type = chat.get("type")
     text = (message.get("text") or "").strip()
-    if not text:
+    caption = (message.get("caption") or "").strip()
+    media = _media_kind(message)
+    # 图片可以带 caption，那就是用户的真实问题，优先用它
+    if not text and caption:
+        text = caption
+    if not text and not media:
         return False, ""
     # 忽略机器人自己和其他机器人
     sender = message.get("from") or {}
@@ -933,6 +1000,87 @@ def _ensure_business_connection(connection_id: str, bot_id: int | None = None) -
         _save_business_connection(conn, bot_id)
 
 
+# Telegram 单条消息上限 4096 字符。留 200 余量给「(1/3)」这种分段标记。
+TG_MSG_LIMIT = 4000
+
+
+def _split_text(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
+    """把超长回复切成几段，优先在段落/句子边界断开。
+
+    原来直接 text[:4000]，第 4001 个字符之后的内容整段消失，用户以为模型
+    话说一半断了。这里按「空行 → 换行 → 句号 → 逗号 → 硬切」的顺序找断点，
+    保证不把一个词劈成两半优先于每段都塞满。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    rest = text
+    # 断点候选：从好到坏。中英文标点都算。
+    seps = ("\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", "；", ";", "，", ",")
+
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = -1
+        # 从窗口末尾往前找最靠后的自然断点，越靠后越能塞满
+        for sep in seps:
+            pos = window.rfind(sep)
+            if pos > cut:
+                cut = pos
+        if cut > limit // 3:
+            # 断点太靠前会切出一堆碎段，宁可硬切
+            if window[cut:cut + 2] in ("\n\n", ". ", "! ", "? "):
+                chunk = rest[:cut + 2].rstrip()
+                rest = rest[cut + 2:]
+            else:
+                chunk = rest[:cut + 1].rstrip()
+                rest = rest[cut + 1:]
+        else:
+            chunk = window
+            rest = rest[limit:]
+        if chunk:
+            chunks.append(chunk)
+    if rest.strip():
+        chunks.append(rest.strip())
+    return chunks
+
+
+def _typing(chat_id: Any, bot_id: int | None = None,
+            business_connection_id: str | None = None) -> None:
+    """发一次「正在输入」。失败无所谓，不能因为它影响回复。"""
+    token = token_of(bot_id)
+    if not token:
+        return
+    payload: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
+    if business_connection_id:
+        payload["business_connection_id"] = business_connection_id
+    try:
+        _api("sendChatAction", token, payload, timeout=10)
+    except BotError:
+        # 状态提示失败不影响正文，静默跳过
+        pass
+
+
+# Telegram 的 typing 状态大约 5 秒后自动消失，续期间隔必须短于它
+TYPING_REFRESH = 4.0
+# 续期上限：超过这个时长还没回复，说明卡住了，别再无意义地刷状态
+TYPING_MAX_SECONDS = 180.0
+
+
+def _typing_loop(chat_id: Any, bot_id: int | None, biz: str | None,
+                 stop: threading.Event) -> None:
+    """后台续期「正在输入」，直到回复发出或超时。"""
+    deadline = time.time() + TYPING_MAX_SECONDS
+    while not stop.is_set() and time.time() < deadline:
+        _typing(chat_id, bot_id, biz)
+        # 用 wait 而不是 sleep：回复一发出就立刻退出，不用等满 4 秒
+        if stop.wait(TYPING_REFRESH):
+            return
+
+
 def _reply(
     chat_id: Any,
     text: str,
@@ -941,17 +1089,24 @@ def _reply(
     bot_id: int | None = None,
 ) -> None:
     token = token_of(bot_id)
-    payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:4000]}
-    if business_connection_id:
-        # 带上这个参数，消息才会以账号主人的身份发出
-        payload["business_connection_id"] = business_connection_id
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
-    try:
-        _api("sendMessage", token, payload)
-    except BotError as exc:
-        log.warning("回复失败：%s", exc)
-        raise
+    chunks = _split_text(text)
+    if not chunks:
+        return
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        body = chunk if total == 1 else f"{chunk}\n\n({index}/{total})"
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": body}
+        if business_connection_id:
+            # 带上这个参数，消息才会以账号主人的身份发出
+            payload["business_connection_id"] = business_connection_id
+        # 只有第一段挂「回复某条消息」，否则每段都带引用，界面会很吵
+        if reply_to and index == 1:
+            payload["reply_to_message_id"] = reply_to
+        try:
+            _api("sendMessage", token, payload)
+        except BotError as exc:
+            log.warning("回复失败（第 %d/%d 段）：%s", index, total, exc)
+            raise
 
 
 def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
@@ -997,11 +1152,43 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
     storage_id = str(chat_id)
     # 有智能体就按智能体存对话和记忆，换机器人接手同一智能体也能接上前文
     scope_id = int(agent["id"]) if agent and agent.get("id") is not None else (bot_id or 0)
+
+    media = _media_kind(message)
+    if media and not text:
+        # 只有媒体没有文字：不猜内容、不瞎编，直接说清楚能做什么。
+        # 关键是「有回应」——原来的实现完全静默，用户会以为机器人死了。
+        hint = (
+            f"我收到了{media}，但我现在还看不了{media}的内容。"
+            "你可以用文字描述一下，我来帮你分析。"
+        )
+        db.add_ai_message(storage_id, title, "user", author, f"[{media}]", bot_id=scope_id)
+        db.add_ai_message(storage_id, title, "assistant", "bot", hint, bot_id=scope_id)
+        try:
+            _reply(chat_id, hint, message.get("message_id"), biz, bot_id)
+        except BotError:
+            return
+        _last_reply[key] = time.time()
+        with _lock:
+            state["replies"] = int(state.get("replies", 0)) + 1
+            state["media_skipped"] = int(state.get("media_skipped", 0)) + 1
+        return
+
     db.add_ai_message(storage_id, title, "user", author, text, bot_id=scope_id)
+
+    # 先亮「正在输入」：模型要 5–20 秒，不发这个用户看到的是死寂。
+    # 在后台每 4 秒续一次，Telegram 的状态只维持约 5 秒，慢请求不续会中途消失。
+    typing_stop = threading.Event()
+    typing_thread = threading.Thread(
+        target=_typing_loop,
+        args=(chat_id, bot_id, biz, typing_stop),
+        daemon=True,
+        name=f"typing-{scope_id}",
+    )
+    typing_thread.start()
 
     try:
         messages = _ai_messages(storage_id, text, author, is_private, bot_id, agent)
-        answer = call_ai(messages, agent=agent) or "（模型没有返回内容）"
+        answer = call_ai(messages, agent=agent, usage_kind="chat") or "（模型没有返回内容）"
     except BotError as exc:
         log.warning("AI 调用失败：%s", exc)
         # 同步到面板状态，否则用户只能翻容器日志才知道为什么没回复
@@ -1011,6 +1198,9 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
         except BotError:
             pass
         return
+    finally:
+        # 无论成功失败都要停掉续期线程，否则它会一直往聊天里刷状态
+        typing_stop.set()
 
     db.add_ai_message(storage_id, title, "assistant", "bot", answer, bot_id=scope_id)
     memory.learn_async(scope_id, storage_id, title, author, text, answer, agent=agent)

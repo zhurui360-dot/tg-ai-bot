@@ -139,6 +139,21 @@ def init_db() -> None:
                 used_at    TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_notes_agent ON ai_notes(agent_id, scope, scope_key);
+            -- 每次调用 AI 的账单流水。上游返回 usage 才记，没返回就记 0，
+            -- 这样「没记到」和「真的花了 0」能区分开（kind='unknown'）。
+            CREATE TABLE IF NOT EXISTS ai_usage (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id   INTEGER NOT NULL DEFAULT 0,
+                bot_id     INTEGER NOT NULL DEFAULT 0,
+                model      TEXT NOT NULL DEFAULT '',
+                kind       TEXT NOT NULL DEFAULT 'chat',
+                prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                ok         INTEGER NOT NULL DEFAULT 1,
+                ts         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_ts ON ai_usage(ts);
             """
         )
         for key, value in DEFAULTS.items():
@@ -333,6 +348,81 @@ def ai_stats(bot_id: int | None = None) -> dict[str, int]:
             f"SELECT COUNT(DISTINCT chat_id) AS n FROM ai_messages{where}", params
         ).fetchone()["n"]
     return {"total": int(total), "today": int(today_row["n"]), "chats": int(chats)}
+
+
+# ---------------- AI 用量流水（ai_usage） ----------------
+#
+# 记流水而不是在 settings 里累加计数器：流水能按天/按智能体/按模型切，
+# 计数器不能。表很小（每轮对话一行），保留 90 天后自动清理。
+
+USAGE_KEEP_DAYS = 90
+
+
+def add_usage(
+    agent_id: int,
+    bot_id: int,
+    model: str,
+    kind: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    latency_ms: int,
+    ok: bool = True,
+) -> None:
+    """记一条用量。上游没给 usage 时两个 token 数都是 0，kind 标成 unknown。"""
+    with connection() as conn:
+        conn.execute(
+            "INSERT INTO ai_usage(agent_id, bot_id, model, kind, prompt_tokens, "
+            "completion_tokens, latency_ms, ok) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                int(agent_id or 0),
+                int(bot_id or 0),
+                str(model or "")[:80],
+                str(kind or "chat")[:20],
+                max(0, int(prompt_tokens or 0)),
+                max(0, int(completion_tokens or 0)),
+                max(0, int(latency_ms or 0)),
+                1 if ok else 0,
+            ),
+        )
+        # 顺手清理过期流水，避免这张表无限长。用本地时间比较，和别处一致。
+        conn.execute(
+            "DELETE FROM ai_usage WHERE ts < datetime('now','localtime','-%d days')"
+            % USAGE_KEEP_DAYS
+        )
+
+
+def usage_summary(days: int = 1) -> dict[str, Any]:
+    """最近 N 天的用量汇总：调用次数、token 数、平均延迟、失败数。
+
+    days=1 表示「今天」（按本地日历天），不是「最近 24 小时」。
+    """
+    days = max(1, min(int(days), 90))
+    if days == 1:
+        since = "date(ts,'localtime')=date('now','localtime')"
+    else:
+        since = "ts >= datetime('now','localtime','-%d days')" % days
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS calls,"
+            " COALESCE(SUM(prompt_tokens),0) AS pin,"
+            " COALESCE(SUM(completion_tokens),0) AS pout,"
+            " COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0) AS failed,"
+            " COALESCE(SUM(CASE WHEN prompt_tokens=0 AND completion_tokens=0 THEN 1 ELSE 0 END),0) AS unmetered,"
+            " COALESCE(AVG(CASE WHEN ok=1 THEN latency_ms END),0) AS avg_ms"
+            " FROM ai_usage WHERE " + since,
+        ).fetchone()
+    return {
+        "calls": int(row["calls"]),
+        "prompt_tokens": int(row["pin"]),
+        "completion_tokens": int(row["pout"]),
+        "total_tokens": int(row["pin"]) + int(row["pout"]),
+        "failed": int(row["failed"]),
+        "avg_ms": int(row["avg_ms"] or 0),
+        # 上游没返回 usage 的调用数。这部分 token 是笔糊涂账，必须让用户看见，
+        # 否则「0 token」会被误解成「没花钱」。
+        "unmetered": int(row["unmetered"]),
+        "days": days,
+    }
 
 
 # ---------------- 长期记忆（ai_notes） ----------------
