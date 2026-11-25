@@ -497,7 +497,8 @@
       loadMemory().catch(function (err) { toast(err.message, "err"); });
     } else if (tab === "settings") {
       fillSettings();
-      loadUpdateStatus();
+      // 先读本地状态把卡片填上，再去 GitHub 核对一次有没有新版本
+      loadUpdateStatus().then(autoCheckUpdate);
       loadBackupStatus();
     } else {
       loadMessages(12).then(renderDashboard).catch(function () {});
@@ -1526,6 +1527,27 @@
       text("updCheckedAt", data.last_check ? "上次检查 " + data.last_check : "");
     } catch (err) {
       console.warn("升级状态加载失败", err);
+    }
+  }
+
+  // 进入设置页时自动比对一次。
+  // 之前只读 /api/update/status（本地缓存的状态），从不问 GitHub，所以卡片上
+  // 永远只有「当前版本」，得用户自己想起来点按钮才知道有没有新版本 —— 看起来
+  // 就是「检测不到新版本」。每次页面加载只自动查一次，切回标签不重复打扰。
+  var updateAutoChecked = false;
+
+  async function autoCheckUpdate() {
+    if (updateAutoChecked) return;
+    updateAutoChecked = true;
+    var box = $("#updateResult");
+    if (box) box.innerHTML = '<p class="dim small mb-0">正在检查更新…</p>';
+    try {
+      var data = await api("/api/update/check");
+      renderUpdateCheck(data);
+      text("updCheckedAt", "上次检查 " + (data.checked_at || ""));
+    } catch (err) {
+      // 自动检查失败不弹错误：可能是暂时断网，点按钮重试就行
+      if (box) box.innerHTML = '<p class="dim small mb-0">自动检查失败，可点「检查更新」重试</p>';
     }
   }
 

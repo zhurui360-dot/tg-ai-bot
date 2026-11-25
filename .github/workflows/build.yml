@@ -1,8 +1,12 @@
 name: build
 
 # push main 或打 tag 时构建镜像并推仓库。
-# NAS 那边由 watchtower 盯 latest 标签，有新镜像就自动重建容器——
-# 于是「改代码 → push」就是一次发布，不用登 NAS。
+#
+# 注意：这套镜像**不是**当前 NAS 的更新通道。watchtower 已经撤掉，容器里跑的是
+# $DATA_DIR/code 这份可写副本，日常更新走面板「设置 → 检查更新 → 立即升级」。
+# 镜像只在两种情况下有用：换机器重新部署，或者需要重装依赖（requirements 变了）。
+# 另外 docker-entrypoint.sh 只在 $DATA_DIR/code 不存在时才拷基线，所以就算拉了
+# 新镜像重建容器，代码副本也不会被覆盖 —— 别指望「更新镜像」等于「更新代码」。
 #
 # 推两个仓库：
 #   GHCR（默认，零配置，用 GITHUB_TOKEN）→ ghcr.io/<owner>/<repo>
