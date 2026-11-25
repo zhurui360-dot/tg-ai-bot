@@ -46,6 +46,14 @@ DEFAULTS: dict[str, str] = {
     "panel_title": os.getenv("APP_TITLE", "").strip() or "TG AI 机器人",
     "known_chats": "",       # 机器人待过的群（JSON）
     "business_connections": "",
+    # ---------- GitHub 备份 ----------
+    "backup_repo": os.getenv("BACKUP_REPO", "").strip(),      # owner/repo
+    "backup_branch": os.getenv("BACKUP_BRANCH", "").strip() or "main",
+    "backup_path": "tg-ai-bot-backup.json",
+    "backup_token": os.getenv("BACKUP_TOKEN", "").strip(),
+    "backup_auto": "0",      # 1 = 定时自动备份
+    "backup_interval": "1440",  # 分钟，默认一天
+    "backup_proxy": "",
 }
 
 # settings 里存的是只有一份的全局配置；这些键在升级后由 _seed_agents 搬进智能体

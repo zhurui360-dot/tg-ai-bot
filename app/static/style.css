@@ -1191,3 +1191,116 @@ a:hover { text-decoration: underline; }
     transition-duration: .01ms !important;
   }
 }
+
+/* ==========================================================================
+   GitHub 备份：三步引导
+   用编号 + 连接线把「建 Token → 粘贴 → 选仓库」串成一条路径，
+   比堆三个并排表单更容易照着做。
+   ========================================================================== */
+
+.bk-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bk-step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  position: relative;
+}
+
+/* 步骤之间的连接线，止于最后一个 */
+.bk-step + .bk-step::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: -2px;
+  height: 16px;
+  width: 1px;
+  background: var(--line-strong);
+}
+
+.bk-num {
+  flex: none;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--brand);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
+}
+
+.bk-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.bk-info code {
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+
+/* 第三行里输入框和按钮并排，空间不够时按钮换行 */
+.bk-step > .row {
+  flex: none;
+}
+
+.bk-adv {
+  margin-top: 8px;
+  border-top: 1px solid var(--line-2);
+  padding-top: 12px;
+}
+
+.bk-adv > summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-2);
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.bk-adv > summary::-webkit-details-marker { display: none; }
+
+.bk-adv > summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .15s ease;
+}
+
+.bk-adv[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.bk-adv > summary:hover { color: var(--brand); }
+
+@media (max-width: 640px) {
+  /* 窄屏放不下「编号 + 文字 + 操作」，操作块换到下一行并对齐文字 */
+  .bk-step {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .bk-step > .row,
+  .bk-step > .btn,
+  .bk-step > .input {
+    flex: 1 1 100%;
+    margin-left: 39px;
+    max-width: calc(100% - 39px) !important;
+  }
+}

@@ -21,3 +21,5 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+# GitHub 备份本地验收数据
+.bkdata/

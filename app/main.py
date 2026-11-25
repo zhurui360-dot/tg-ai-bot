@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, bot, db, memory, security, updater
+from . import __version__, backup, bot, db, memory, security, updater
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -42,8 +42,11 @@ async def lifespan(app: FastAPI):
         log.warning("STANDBY=1：值守模式，只提供面板，不启动机器人")
     else:
         bot.start()
+    # 自动备份线程：只有开了开关且配了仓库+Token 才会真正干活
+    backup.auto.start()
     log.info("TG AI Bot %s 已启动", __version__)
     yield
+    backup.auto.stop()
     if not STANDBY:
         bot.stop()
 
@@ -780,4 +783,88 @@ def update_status(_: None = Depends(require_auth)) -> dict[str, Any]:
         "installed_at": state.get("installed_at", ""),
         "last_check": state.get("last_check", ""),
         "code_dir": str(updater.CODE_DIR),
+    }
+
+# ---------------- GitHub 备份 ----------------
+#
+# 备份只导出「配置 / 智能体 / 记忆」，不含对话记录与任何密钥。
+# 密钥进 git 历史等于永久泄露，所以恢复后需要重填一次。
+
+@app.get("/api/backup/status")
+def backup_status(_: None = Depends(require_auth)) -> dict[str, Any]:
+    return backup.status()
+
+
+@app.put("/api/backup/config")
+def backup_config(body: dict[str, Any], _: None = Depends(require_auth)) -> dict[str, Any]:
+    """保存备份配置。Token 留空表示不修改。"""
+    if "repo" in body:
+        value = str(body.get("repo", "")).strip()
+        if value and ("/" not in value or value.count("/") != 1):
+            raise HTTPException(status_code=400, detail="仓库要写成 owner/repo")
+        db.set_setting("backup_repo", value)
+    if "branch" in body:
+        db.set_setting("backup_branch", str(body.get("branch", "")).strip() or "main")
+    if "path" in body:
+        db.set_setting("backup_path", str(body.get("path", "")).strip() or "tg-ai-bot-backup.json")
+    if "token" in body:
+        value = str(body.get("token", "")).strip()
+        if value:
+            db.set_setting("backup_token", value)
+    if "auto" in body:
+        db.set_setting("backup_auto", "1" if str(body.get("auto")) in ("1", "true", "True") else "0")
+    if "interval" in body:
+        try:
+            minutes = int(float(body.get("interval") or 1440))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="间隔要填数字（分钟）")
+        db.set_setting("backup_interval", str(max(10, minutes)))
+    if "proxy" in body:
+        db.set_setting("backup_proxy", str(body.get("proxy", "")).strip())
+    return {"ok": True, "status": backup.status()}
+
+
+@app.post("/api/backup/verify")
+def backup_verify(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """校验 Token 与仓库权限，顺带当出网探针。"""
+    return backup.verify_token()
+
+
+@app.post("/api/backup/create-repo")
+def backup_create_repo(body: dict[str, Any], _: None = Depends(require_auth)) -> dict[str, Any]:
+    name = str(body.get("name", "")).strip()
+    result = backup.create_repo(name, private=True)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "创建失败")
+    return result
+
+
+@app.post("/api/backup/push")
+def backup_push(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """立刻备份一次。"""
+    return backup.push()
+
+
+@app.post("/api/backup/restore")
+def backup_restore(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """从远端备份恢复。会覆盖同 id 的智能体配置。"""
+    fetched = backup.fetch_remote()
+    if not fetched.get("ok"):
+        raise HTTPException(status_code=400, detail=fetched.get("error") or "读取备份失败")
+    result = backup.restore(fetched["payload"])
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "恢复失败")
+    return result
+
+
+@app.get("/api/backup/preview")
+def backup_preview(_: None = Depends(require_auth)) -> dict[str, Any]:
+    """只看远端备份里有什么，不写入。恢复前先看一眼更稳妥。"""
+    fetched = backup.fetch_remote()
+    if not fetched.get("ok"):
+        return fetched
+    return {
+        "ok": True,
+        "exported_at": fetched.get("exported_at", ""),
+        "counts": fetched.get("counts", {}),
     }

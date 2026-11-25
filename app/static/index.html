@@ -276,6 +276,89 @@
       </div>
 
       <div class="card">
+        <div class="card-head"><div><h3>GitHub 备份</h3><p class="sub">把配置、智能体、长期记忆存到私有仓库</p></div></div>
+        <div class="card-body">
+          <div class="bk-steps">
+            <div class="bk-step">
+              <div class="bk-num">1</div>
+              <div class="bk-info">
+                <div class="strong small">创建访问 Token</div>
+                <div class="dim tiny">链接已自动勾选 <b>Contents: Read and write</b>，这是备份唯一需要的权限。</div>
+              </div>
+              <a class="btn sm" id="bkTokenLink" href="https://github.com/settings/personal-access-tokens/new?name=tg-ai-bot-backup&contents=write&expires_in=90" target="_blank" rel="noopener noreferrer">
+                一键直达 GitHub
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/></svg>
+              </a>
+            </div>
+            <div class="bk-step">
+              <div class="bk-num">2</div>
+              <div class="bk-info">
+                <div class="strong small">粘贴 Token</div>
+                <div class="dim tiny">以 <code class="mono">github_pat_</code> 或 <code class="mono">ghp_</code> 开头，创建后只显示一次。</div>
+              </div>
+              <input class="input" id="bkToken" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" style="max-width:260px">
+            </div>
+            <div class="bk-step">
+              <div class="bk-num">3</div>
+              <div class="bk-info">
+                <div class="strong small">选择备份仓库</div>
+                <div class="dim tiny" id="bkRepoHint">填 <code class="mono">owner/repo</code>，或直接建一个新的私有仓库。</div>
+              </div>
+              <div class="row">
+                <input class="input" id="bkRepo" placeholder="owner/repo" style="max-width:200px">
+                <button class="btn sm" data-act="backup-create-repo">建私有仓库</button>
+              </div>
+            </div>
+          </div>
+
+          <details class="bk-adv">
+            <summary>高级选项</summary>
+            <div class="grid-3 mt-12">
+              <div class="field">
+                <label>分支</label>
+                <input class="input" id="bkBranch" placeholder="main">
+              </div>
+              <div class="field">
+                <label>文件路径</label>
+                <input class="input" id="bkPath" placeholder="tg-ai-bot-backup.json">
+              </div>
+              <div class="field">
+                <label>代理（可选）</label>
+                <input class="input" id="bkProxy" placeholder="http://127.0.0.1:7890">
+              </div>
+            </div>
+            <div class="row mt-12 wrap">
+              <label class="switch">
+                <input type="checkbox" id="bkAuto">
+                <span class="switch-track"></span>
+                <span class="switch-label">定时自动备份</span>
+              </label>
+              <div class="row" style="gap:8px">
+                <span class="dim small">每</span>
+                <input class="input" id="bkInterval" type="number" min="10" style="max-width:100px" placeholder="1440">
+                <span class="dim small">分钟</span>
+              </div>
+            </div>
+          </details>
+
+          <dl class="kv mt-16">
+            <dt>上次备份</dt><dd id="bkLast">—</dd>
+            <dt>提交</dt><dd id="bkCommit" class="mono">—</dd>
+            <dt>备份内容</dt><dd class="dim small">配置 · 智能体 · 长期记忆（不含对话记录与密钥）</dd>
+          </dl>
+          <div id="backupResult"></div>
+        </div>
+        <div class="card-foot">
+          <span class="dim small" id="bkStatus"></span>
+          <div class="row">
+            <button class="btn" data-act="backup-verify">校验连接</button>
+            <button class="btn" data-act="backup-restore">从备份恢复</button>
+            <button class="btn primary" data-act="backup-push">立即备份</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-head"><div><h3>出网诊断</h3><p class="sub">机器人连不上 Telegram 时先看这里</p></div></div>
         <div class="card-body" id="diagResult">
           <p class="dim small mb-0">还没检测。点下方按钮开始。</p>
