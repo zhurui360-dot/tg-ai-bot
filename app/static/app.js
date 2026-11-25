@@ -1023,7 +1023,7 @@
       if (!item.key_set) badges += '<span class="badge err">缺 Key</span>';
 
       var meta = [item.model || "未设模型", item.base_url || "未设地址"];
-      var nums = "温度 " + (item.temperature || "0.7") + " · 上下文 " + (item.history_len || 0) + " 轮 · 上限 " + (item.max_tokens || 0);
+      var nums = "温度 " + (item.temperature || "0.7") + " · 上下文 " + (item.history_len || 0) + " 轮 · 上限 " + (item.max_tokens || 0) + (item.vision ? " · 可看图" : "");
 
       return (
         '<div class="row-item">' +
@@ -1109,8 +1109,8 @@
           "</div>" +
           '<div class="field">' +
             "<label>最大回复 tokens</label>" +
-            '<input class="input" id="agMaxTokens" type="number" min="64" max="4096" value="' + esc(editing ? editing.max_tokens : "800") + '">' +
-            '<div class="hint">太短会说到一半被切。</div>' +
+            '<input class="input" id="agMaxTokens" type="number" min="64" max="8192" value="' + esc(editing ? editing.max_tokens : "1600") + '">' +
+            '<div class="hint">太短会说到一半被切。8192 是多数模型的安全值，超长回复会自动分段发出。</div>' +
           "</div>" +
           '<div class="field">' +
             "<label>记住几轮上下文</label>" +
@@ -1129,6 +1129,14 @@
             '<input class="input mono" id="agProxy" placeholder="留空跟随全局" value="' + esc(editing ? editing.proxy : "") + '">' +
             '<div class="hint">AI 接口和 Telegram 走的网络不一样时用。</div>' +
           "</div>" +
+        "</div>" +
+        '<div class="field">' +
+          '<label class="switch">' +
+            '<input type="checkbox" id="agVision"' + (editing && editing.vision ? " checked" : "") + ">" +
+            '<span class="switch-track"></span>' +
+            '<span class="switch-label">图片理解（能看用户发的图）</span>' +
+          "</label>" +
+          '<div class="hint">开了才会把图片传给它看。模型本身必须支持多模态（如 gpt-4o、qwen-vl、glm-4v），否则接口会报错；没开时收到图片会明确回复「看不了」，不会瞎猜内容。</div>' +
         "</div>" +
         '<div class="field">' +
           '<label class="switch">' +
@@ -1165,6 +1173,7 @@
             history_len: $("#agHistory", modal.el).value,
             min_interval: $("#agInterval", modal.el).value,
             proxy: ($("#agProxy", modal.el).value || "").trim(),
+            vision: $("#agVision", modal.el).checked,
             enabled: $("#agEnabled", modal.el).checked
           };
           if (!payload.name) { toast("给智能体起个名字", "err"); $("#agName", modal.el).focus(); return; }

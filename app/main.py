@@ -231,11 +231,11 @@ SETTING_KEYS = {
     "bot_enabled", "bot_token", "bot_trigger", "ai_agent_id",
     "ai_base_url", "ai_api_key", "ai_model", "ai_system_prompt",
     "ai_history_len", "ai_max_tokens", "ai_temperature", "ai_min_interval",
-    "ai_proxy",
+    "ai_proxy", "ai_vision",
     "memory_enabled", "memory_learn", "memory_max_notes",
 }
 SECRET_KEYS = {"panel_password", "bot_token", "ai_api_key"}
-TOGGLE_KEYS = {"memory_enabled", "memory_learn", "bot_enabled"}
+TOGGLE_KEYS = {"memory_enabled", "memory_learn", "bot_enabled", "ai_vision"}
 BOT_NUMERIC_KEYS = {"ai_history_len", "ai_max_tokens", "ai_temperature", "ai_min_interval"}
 
 
@@ -577,9 +577,12 @@ def _agent_payload(body: dict[str, Any], current: dict[str, Any] | None = None) 
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"{key} 必须是数字")
 
-    enabled = body.get("enabled", True)
-    if isinstance(enabled, str):
-        enabled = enabled.lower() in ("1", "true", "on", "yes")
+    def flag(key: str, default: bool) -> bool:
+        value = body.get(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "on", "yes")
+        return bool(value)
+
     return {
         "name": name,
         "base_url": base_url,
@@ -587,11 +590,12 @@ def _agent_payload(body: dict[str, Any], current: dict[str, Any] | None = None) 
         "model": model,
         "system_prompt": str(body.get("system_prompt", "")).strip(),
         "temperature": f"{number('temperature', 0.7, 0.0, 2.0):g}",
-        "max_tokens": int(number("max_tokens", 800, 64, 4096)),
+        "max_tokens": int(number("max_tokens", 1600, 64, 8192)),
         "history_len": int(number("history_len", 12, 0, 40)),
         "min_interval": int(number("min_interval", 3, 0, 60)),
         "proxy": str(body.get("proxy", "")).strip(),
-        "enabled": bool(enabled),
+        "vision": flag("vision", False),
+        "enabled": flag("enabled", True),
     }
 
 

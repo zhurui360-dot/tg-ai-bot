@@ -13,6 +13,7 @@ update_offset / Business 连接，互不干扰。
 """
 from __future__ import annotations
 
+import base64
 import functools
 import http.client
 import json
@@ -470,7 +471,9 @@ def _ai_messages(
     is_private: bool,
     bot_id: int | None = None,
     agent: dict[str, Any] | None = None,
-) -> list[dict[str, str]]:
+    author_id: str = "",
+    extra: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     if agent is None:
         agent = db.agent_for_bot(bot_id)
     cfg = _agent_cfg(agent)
@@ -500,7 +503,10 @@ def _ai_messages(
         history_len = 12
     # 老配置没有 agent 维度时按 bot 存；有 agent 时按 agent 存，换机器人的同一智能体也能接上前文
     scope_id = int(agent["id"]) if agent and agent.get("id") is not None else (bot_id or 0)
-    for item in db.ai_history(chat_id, history_len, bot_id=scope_id):
+    # 群里按发言人取历史：不隔离的话，张三问「我明天几点的会」再问「刚说的」，
+    # 中间李四插一句，模型会把李四的话当成张三说的。私聊只有一个对象，不用筛。
+    history_author = "" if is_private else author_id
+    for item in db.ai_history(chat_id, history_len, bot_id=scope_id, author_id=history_author):
         role = item.get("role")
         content = str(item.get("content") or "").strip()
         if role not in ("user", "assistant") or not content:
@@ -510,7 +516,11 @@ def _ai_messages(
         messages.append({"role": role, "content": content})
 
     prefix = "" if is_private else f"{author}："
-    messages.append({"role": "user", "content": prefix + user_text})
+    # 图片走多模态时，这一条 message 的 content 是数组而不是字符串
+    if extra:
+        messages.append({"role": "user", "content": [{"type": "text", "text": prefix + user_text}, *extra]})
+    else:
+        messages.append({"role": "user", "content": prefix + user_text})
     return messages
 
 
@@ -576,10 +586,12 @@ def call_ai(messages: list[dict[str, str]], agent: dict[str, Any] | None = None,
     except security.SecurityError as exc:
         raise BotError(str(exc)) from exc
     try:
-        max_tokens = max(64, min(int(cfg.get("ai_max_tokens", "800")), 4096))
+        # 上限放到 8192：Claude / GPT-4 系普遍支持更长，而分段发送已经能兜住
+        # Telegram 单条 4096 字的限制，没必要在模型这一侧再砍一刀
+        max_tokens = max(64, min(int(cfg.get("ai_max_tokens", "1600")), 8192))
         temperature = max(0.0, min(float(cfg.get("ai_temperature", "0.7")), 2.0))
     except ValueError:
-        max_tokens, temperature = 800, 0.7
+        max_tokens, temperature = 1600, 0.7
 
     payload = json.dumps(
         {
@@ -847,6 +859,13 @@ _MEDIA_KINDS = (
 )
 
 
+def _author_id(message: dict[str, Any]) -> str:
+    """发言人 ID。群里靠它区分是谁，昵称会重名、也能随便改。"""
+    sender = message.get("from") or {}
+    raw = sender.get("id")
+    return "" if raw is None else str(raw)
+
+
 def _media_kind(message: dict[str, Any]) -> str:
     """消息里带的是哪种非文本内容，没有就返回空串。"""
     for key, label in _MEDIA_KINDS:
@@ -1048,6 +1067,107 @@ def _split_text(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
     return chunks
 
 
+# ---------------- 图片理解 ----------------
+#
+# 走 Telegram getFile 把图下载下来，转成 data URL 塞进 image_url，
+# 让支持多模态的模型直接看图。只做「真看」这一条路：
+# 没开视觉、下载失败、模型不认，都明确告诉用户看不了，绝不猜内容。
+
+# 机器人下载文件走 Bot API，上限 20MB。超大图先按最大尺寸的缩略图拿。
+VISION_MAX_BYTES = 20 * 1024 * 1024
+# 一张图 base64 后约涨 4/3，太大既费钱又可能被上游拒绝；3MB 足够看清截图
+VISION_MAX_RAW = 3 * 1024 * 1024
+
+_MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _image_ref(message: dict[str, Any]) -> tuple[str, str] | None:
+    """从消息里找出可下载的图片：返回 (file_id, 形态说明)，不是图片就 None。
+
+    photo 是一组尺寸，按 Telegram 的约定最后一个最大，但最大那张常常超过
+    20MB 下载上限，所以从大到小挑第一张能下的。
+    """
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        usable = [
+            item for item in photos
+            if isinstance(item, dict) and item.get("file_id")
+        ]
+        # 按体积从大到小排，优先拿清晰的那张；Telegram 的数组顺序不保证递增
+        usable.sort(key=lambda item: int(item.get("file_size") or 0), reverse=True)
+        for item in usable:
+            size = int(item.get("file_size") or 0)
+            # 没报体积的也试一下，总比直接放弃好
+            if not size or size <= VISION_MAX_BYTES:
+                return str(item["file_id"]), ""
+        if usable:
+            return str(usable[0]["file_id"]), ""
+    # 以文件形式发的图（未压缩）
+    document = message.get("document")
+    if isinstance(document, dict):
+        mime = str(document.get("mime_type") or "")
+        if mime.startswith("image/"):
+            return str(document.get("file_id") or ""), str(document.get("file_name") or "")
+    # 贴纸：静态贴纸能看，动态/视频贴纸看不了
+    sticker = message.get("sticker")
+    if isinstance(sticker, dict):
+        animated = sticker.get("is_animated") or sticker.get("is_video")
+        if not animated and sticker.get("file_id"):
+            return str(sticker["file_id"]), ""
+    return None
+
+
+def _download_image(file_id: str, bot_id: int | None = None) -> tuple[bytes, str]:
+    """下载图片，返回 (字节, mime)。失败抛 BotError，由调用方决定怎么告诉用户。"""
+    token = token_of(bot_id)
+    if not token:
+        raise BotError("没配 Bot Token，取不到图片")
+    info = _api("getFile", token, {"file_id": file_id}, timeout=30) or {}
+    path = str(info.get("file_path") or "")
+    size = int(info.get("file_size") or 0)
+    if not path:
+        raise BotError("Telegram 没有返回图片路径（文件可能已过期）")
+    if size > VISION_MAX_BYTES:
+        raise BotError("图片超过 20MB，Bot API 下载不了，请压缩后再发")
+    url = f"{API_ROOT}/file/bot{token}/{path}"
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+    try:
+        with _opener.open(request, timeout=60) as response:
+            raw = response.read(VISION_MAX_RAW + 1)
+    except urllib.error.HTTPError as exc:
+        raise BotError(f"下载图片失败：HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise BotError(f"下载图片失败：{exc.reason}") from exc
+    except TimeoutError as exc:
+        raise BotError("下载图片超时") from exc
+    if len(raw) > VISION_MAX_RAW:
+        raise BotError("图片太大（转码后超过 3MB），请压缩或截小一点再发")
+    if not raw:
+        raise BotError("下载到的图片是空的")
+    suffix = os.path.splitext(path)[1].lower()
+    mime = _MIME_BY_SUFFIX.get(suffix, "image/jpeg")
+    return raw, mime
+
+
+def _image_part(raw: bytes, mime: str) -> dict[str, Any]:
+    """拼成 OpenAI 兼容的多模态 content 片段。"""
+    encoded = base64.b64encode(raw).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+
+
+def vision_enabled(agent: dict[str, Any] | None) -> bool:
+    """这个智能体是否开了图片理解。没绑智能体时看全局开关。"""
+    if agent is None:
+        return db.get_setting("ai_vision", "0") == "1"
+    return bool(agent.get("vision"))
+
+
 def _typing(chat_id: Any, bot_id: int | None = None,
             business_connection_id: str | None = None) -> None:
     """发一次「正在输入」。失败无所谓，不能因为它影响回复。"""
@@ -1148,21 +1268,46 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
 
     title = _chat_title(message)
     author = _author(message)
+    author_id = _author_id(message)
     is_private = chat.get("type") == "private"
     storage_id = str(chat_id)
     # 有智能体就按智能体存对话和记忆，换机器人接手同一智能体也能接上前文
     scope_id = int(agent["id"]) if agent and agent.get("id") is not None else (bot_id or 0)
 
     media = _media_kind(message)
-    if media and not text:
-        # 只有媒体没有文字：不猜内容、不瞎编，直接说清楚能做什么。
-        # 关键是「有回应」——原来的实现完全静默，用户会以为机器人死了。
-        hint = (
-            f"我收到了{media}，但我现在还看不了{media}的内容。"
+    image = _image_ref(message)
+    can_see = bool(image) and vision_enabled(agent)
+
+    def _cannot_see(reason: str) -> str:
+        """看不了图时的回话。三种原因分开说，别让用户猜。"""
+        if reason == "vision_off":
+            return (
+                f"我收到了{media or '图片'}。要让我看图，请到面板里给这个智能体打开"
+                "「图片理解」——模型本身也要支持看图（例如 gpt-4o、qwen-vl、glm-4v）。"
+                "现在我只能读文字，你可以描述一下图里是什么。"
+            )
+        if reason:
+            return (
+                f"我收到了{media or '图片'}，但这次没读到：{reason}。"
+                "可以重发一次，或者换成文字描述。"
+            )
+        return (
+            f"我收到了{media or '这个文件'}，但我现在还看不了它的内容。"
             "你可以用文字描述一下，我来帮你分析。"
         )
-        db.add_ai_message(storage_id, title, "user", author, f"[{media}]", bot_id=scope_id)
-        db.add_ai_message(storage_id, title, "assistant", "bot", hint, bot_id=scope_id)
+
+    # 只有媒体、没有文字、图片又读不到：没必要下载，直接说清楚能力边界。
+    # 「有回应」是关键——老实现完全静默，用户会以为机器人死了。
+    if media and not text and not can_see:
+        if image:
+            reason = "vision_off"
+        else:
+            reason = ""   # 语音/文件/贴纸等：本来就不支持
+        hint = _cannot_see(reason)
+        db.add_ai_message(storage_id, title, "user", author, f"[{media}]", bot_id=scope_id,
+                          author_id=author_id)
+        db.add_ai_message(storage_id, title, "assistant", "bot", hint, bot_id=scope_id,
+                          author_id=author_id)
         try:
             _reply(chat_id, hint, message.get("message_id"), biz, bot_id)
         except BotError:
@@ -1173,10 +1318,8 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
             state["media_skipped"] = int(state.get("media_skipped", 0)) + 1
         return
 
-    db.add_ai_message(storage_id, title, "user", author, text, bot_id=scope_id)
-
-    # 先亮「正在输入」：模型要 5–20 秒，不发这个用户看到的是死寂。
-    # 在后台每 4 秒续一次，Telegram 的状态只维持约 5 秒，慢请求不续会中途消失。
+    # 先亮「正在输入」再下载图片：getFile + 下载是一次额外往返，先发状态
+    # 用户才不会对着空聊天窗干等。后面模型调用也复用这个续期线程。
     typing_stop = threading.Event()
     typing_thread = threading.Thread(
         target=_typing_loop,
@@ -1186,8 +1329,56 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
     )
     typing_thread.start()
 
+    image_parts: list[dict[str, Any]] = []
+    vision_note = ""
+    if image and can_see:
+        try:
+            raw, mime = _download_image(image[0], bot_id)
+            image_parts.append(_image_part(raw, mime))
+        except BotError as exc:
+            vision_note = str(exc)
+            log.info("图片下载失败：%s", exc)
+
+    # 下载失败又没配文字：别为了说一句「看不了」去花一次模型调用，
+    # 直接回现状，并顺手把 typing 停掉。
+    if image and not image_parts and not text:
+        typing_stop.set()
+        hint = _cannot_see(vision_note or "vision_off")
+        db.add_ai_message(storage_id, title, "user", author, f"[{media}]", bot_id=scope_id,
+                          author_id=author_id)
+        db.add_ai_message(storage_id, title, "assistant", "bot", hint, bot_id=scope_id,
+                          author_id=author_id)
+        try:
+            _reply(chat_id, hint, message.get("message_id"), biz, bot_id)
+        except BotError:
+            return
+        _last_reply[key] = time.time()
+        with _lock:
+            state["replies"] = int(state.get("replies", 0)) + 1
+        return
+
+    # 有图没看成、但用户还打了字：必须让模型知道图没读到。
+    # 否则它只看到那句问题，会照着自己的想象编一段图片内容出来。
+    if image and not image_parts:
+        reason = (
+            f"我尝试读取这张图但失败了（{vision_note}）"
+            if vision_note
+            else "我这边没有开启图片理解，看不到这张图"
+        )
+        text = f"（用户发了一张图片，{reason}，请不要猜测图片内容。）\n{text}"
+    elif image_parts and not text:
+        # 光发图不打字，给模型一句明确的指令，别让它对着一张图发愣
+        text = "看看这张图，说说里面有什么。"
+
+    stored = f"[图片] {text}".strip() if image_parts else text
+    db.add_ai_message(storage_id, title, "user", author, stored, bot_id=scope_id,
+                      author_id=author_id)
+
     try:
-        messages = _ai_messages(storage_id, text, author, is_private, bot_id, agent)
+        messages = _ai_messages(
+            storage_id, text, author, is_private, bot_id, agent,
+            author_id=author_id, extra=image_parts,
+        )
         answer = call_ai(messages, agent=agent, usage_kind="chat") or "（模型没有返回内容）"
     except BotError as exc:
         log.warning("AI 调用失败：%s", exc)
@@ -1202,7 +1393,8 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
         # 无论成功失败都要停掉续期线程，否则它会一直往聊天里刷状态
         typing_stop.set()
 
-    db.add_ai_message(storage_id, title, "assistant", "bot", answer, bot_id=scope_id)
+    db.add_ai_message(storage_id, title, "assistant", "bot", answer, bot_id=scope_id,
+                      author_id=author_id)
     memory.learn_async(scope_id, storage_id, title, author, text, answer, agent=agent)
     if state["last_error"].startswith("AI 调用失败"):
         state["last_error"] = ""

@@ -34,10 +34,12 @@ DEFAULTS: dict[str, str] = {
     "ai_agent_id": "",
     "ai_system_prompt": "你是一个在 Telegram 里聊天的助手，回答简洁、口语化，用中文回复。不确定的事不要编造。",
     "ai_history_len": "12",
-    "ai_max_tokens": "800",
+    "ai_max_tokens": "1600",
     "ai_temperature": "0.7",
     "ai_min_interval": "3",
     "ai_proxy": os.getenv("AI_PROXY", "").strip(),
+    # 没绑智能体时的图片理解开关（智能体各自的开关在 ai_agents.vision）
+    "ai_vision": "0",
     # ---------- 长期记忆 ----------
     "memory_enabled": "1",   # 把长期记忆注入上下文
     "memory_learn": "1",     # 聊完自动提炼值得记住的事
@@ -110,10 +112,11 @@ def init_db() -> None:
                 model         TEXT NOT NULL DEFAULT '',
                 system_prompt TEXT NOT NULL DEFAULT '',
                 temperature   TEXT NOT NULL DEFAULT '0.7',
-                max_tokens    INTEGER NOT NULL DEFAULT 800,
+                max_tokens    INTEGER NOT NULL DEFAULT 1600,
                 history_len   INTEGER NOT NULL DEFAULT 12,
                 min_interval  INTEGER NOT NULL DEFAULT 3,
                 proxy         TEXT NOT NULL DEFAULT '',
+                vision        INTEGER NOT NULL DEFAULT 0,
                 enabled       INTEGER NOT NULL DEFAULT 1,
                 created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -124,10 +127,15 @@ def init_db() -> None:
                 chat_title TEXT NOT NULL DEFAULT '',
                 role       TEXT NOT NULL,
                 author     TEXT NOT NULL DEFAULT '',
+                -- 发言人 ID。群里要按人隔离上下文，只靠昵称会撞名；
+                -- assistant 行记的是「这轮在回谁」，用来把回答归到对应的人。
+                author_id  TEXT NOT NULL DEFAULT '',
                 content    TEXT NOT NULL,
                 ts         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_ai_chat ON ai_messages(bot_id, chat_id, id DESC);
+            -- 按发言人建索引这步放在 _migrate_columns 里：老库此刻还没有 author_id 列，
+            -- 写在这里会让整个建表脚本直接失败。
             CREATE TABLE IF NOT EXISTS ai_notes (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id   INTEGER NOT NULL DEFAULT 0,
@@ -193,6 +201,21 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         if column not in bots:
             conn.execute(f"ALTER TABLE bots ADD COLUMN {column} {ddl}")
 
+    agents = _columns(conn, "ai_agents")
+    if "vision" not in agents:
+        conn.execute("ALTER TABLE ai_agents ADD COLUMN vision INTEGER NOT NULL DEFAULT 0")
+
+    # 老对话没有发言人 ID。历史消息一律留空串，读的时候按「群聊只取有 ID 的」
+    # 处理，升级前的老上下文自然被排除——宁可少几轮上文，也不要把 A 的话
+    # 当成 B 说的塞进上下文。
+    messages = _columns(conn, "ai_messages")
+    if "author_id" not in messages:
+        conn.execute("ALTER TABLE ai_messages ADD COLUMN author_id TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_chat_author "
+        "ON ai_messages(bot_id, chat_id, author_id, id DESC)"
+    )
+
 
 def _seed_agents(conn: sqlite3.Connection) -> None:
     """把老的单份 AI 配置提升成第一个智能体。
@@ -221,7 +244,7 @@ def _seed_agents(conn: sqlite3.Connection) -> None:
             data.get("ai_model", ""),
             data.get("ai_system_prompt", ""),
             data.get("ai_temperature", "0.7") or "0.7",
-            int(float(data.get("ai_max_tokens", "800") or 800)),
+            int(float(data.get("ai_max_tokens", "1600") or 1600)),
             int(float(data.get("ai_history_len", "12") or 12)),
             int(float(data.get("ai_min_interval", "3") or 3)),
             data.get("ai_proxy", ""),
@@ -282,12 +305,21 @@ def add_ai_message(
     author: str,
     content: str,
     bot_id: int = 0,
+    author_id: str = "",
 ) -> None:
     with connection() as conn:
         conn.execute(
-            "INSERT INTO ai_messages(bot_id, chat_id, chat_title, role, author, content) "
-            "VALUES(?,?,?,?,?,?)",
-            (int(bot_id or 0), str(chat_id), chat_title[:120], role, author[:80], content[:4000]),
+            "INSERT INTO ai_messages(bot_id, chat_id, chat_title, role, author, author_id, content) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                int(bot_id or 0),
+                str(chat_id),
+                chat_title[:120],
+                role,
+                author[:80],
+                str(author_id or "")[:32],
+                content[:4000],
+            ),
         )
         # 每个会话只保留最近 60 条，避免无限增长（按智能体分开算）
         conn.execute(
@@ -297,15 +329,28 @@ def add_ai_message(
         )
 
 
-def ai_history(chat_id: str, limit: int = 12, bot_id: int = 0) -> list[dict[str, Any]]:
-    """取最近若干条对话，按时间正序返回，供拼接上下文。"""
+def ai_history(
+    chat_id: str,
+    limit: int = 12,
+    bot_id: int = 0,
+    author_id: str = "",
+) -> list[dict[str, Any]]:
+    """取最近若干条对话，按时间正序返回，供拼接上下文。
+
+    author_id 非空时只取这个人和机器人的往返：群里张三问的话不会跑到
+    李四的上下文里。老数据没有 author_id（空串），会被这个条件排除掉——
+    升级后第一轮可能少几行上文，但不会张冠李戴。
+    """
     limit = max(1, min(int(limit), 40))
+    sql = "SELECT role, author, author_id, content, ts FROM ai_messages WHERE bot_id=? AND chat_id=?"
+    params: list[Any] = [int(bot_id or 0), str(chat_id)]
+    if author_id:
+        sql += " AND author_id=?"
+        params.append(str(author_id))
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
     with connection() as conn:
-        rows = conn.execute(
-            "SELECT role, author, content, ts FROM ai_messages "
-            "WHERE bot_id=? AND chat_id=? ORDER BY id DESC LIMIT ?",
-            (int(bot_id or 0), str(chat_id), limit),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [dict(row) for row in reversed(rows)]
 
 
@@ -526,13 +571,15 @@ def note_stats(agent_id: int) -> dict[str, int]:
 
 AGENT_FIELDS = (
     "name", "base_url", "api_key", "model", "system_prompt",
-    "temperature", "max_tokens", "history_len", "min_interval", "proxy", "enabled",
+    "temperature", "max_tokens", "history_len", "min_interval", "proxy",
+    "vision", "enabled",
 )
 
 
 def _agent_row(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["enabled"] = bool(data.get("enabled"))
+    data["vision"] = bool(data.get("vision"))
     data["key_set"] = bool(str(data.get("api_key") or "").strip())
     return data
 
@@ -553,8 +600,8 @@ def add_agent(data: dict[str, Any]) -> int:
     with connection() as conn:
         cur = conn.execute(
             "INSERT INTO ai_agents(name, base_url, api_key, model, system_prompt, "
-            "temperature, max_tokens, history_len, min_interval, proxy, enabled) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "temperature, max_tokens, history_len, min_interval, proxy, vision, enabled) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 data.get("name") or "未命名智能体",
                 data.get("base_url", ""),
@@ -562,10 +609,11 @@ def add_agent(data: dict[str, Any]) -> int:
                 data.get("model", ""),
                 data.get("system_prompt", ""),
                 str(data.get("temperature", "0.7")),
-                int(data.get("max_tokens", 800)),
+                int(data.get("max_tokens", 1600)),
                 int(data.get("history_len", 12)),
                 int(data.get("min_interval", 3)),
                 data.get("proxy", ""),
+                1 if data.get("vision", False) else 0,
                 1 if data.get("enabled", True) else 0,
             ),
         )
@@ -580,7 +628,7 @@ def update_agent(agent_id: int, data: dict[str, Any]) -> bool:
     with connection() as conn:
         cur = conn.execute(
             "UPDATE ai_agents SET name=?, base_url=?, api_key=?, model=?, system_prompt=?, "
-            "temperature=?, max_tokens=?, history_len=?, min_interval=?, proxy=?, enabled=? "
+            "temperature=?, max_tokens=?, history_len=?, min_interval=?, proxy=?, vision=?, enabled=? "
             "WHERE id=?",
             (
                 merged.get("name") or "未命名智能体",
@@ -589,10 +637,11 @@ def update_agent(agent_id: int, data: dict[str, Any]) -> bool:
                 merged.get("model", ""),
                 merged.get("system_prompt", ""),
                 str(merged.get("temperature", "0.7")),
-                int(merged.get("max_tokens", 800)),
+                int(merged.get("max_tokens", 1600)),
                 int(merged.get("history_len", 12)),
                 int(merged.get("min_interval", 3)),
                 merged.get("proxy", ""),
+                1 if merged.get("vision", False) else 0,
                 1 if merged.get("enabled", True) else 0,
                 agent_id,
             ),
