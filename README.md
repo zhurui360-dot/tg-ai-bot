@@ -119,31 +119,55 @@ Windows PowerShell 用 `$env:DATA_DIR="./data"` 这种写法。
 
 ## NAS 部署
 
-### 路线 A：能 build 的 NAS（推荐）
+### 路线 A：用预构建镜像（推荐）
 
-群晖、威联通、fnOS 只要 Docker 能正常用，直接照「快速开始」走就行，把项目目录放在 Docker 的共享目录里。
-
-### 路线 B：不方便 build 的 NAS
-
-有些 NAS 的 Docker 面板只让你填镜像名和命令，不给构建。两个办法：
-
-**B1. 用现成镜像**
+仓库推 `main` 就自动构建并推到 GHCR，镜像同时包含 **amd64 和 arm64**，Intel/AMD 和 ARM 的 NAS 都能直接拉。
 
 ```bash
-docker build -t tg-ai-bot:latest .    # 在任意一台能 build 的机器上
-docker save tg-ai-bot:latest | gzip > tg-ai-bot.tar.gz
+docker pull ghcr.io/zhurui360-dot/tg-ai-bot:latest
 ```
 
-把 tar 传到 NAS，在面板里「导入镜像」，然后按下面填：
+然后在 NAS 面板里建容器：
 
 | 项 | 值 |
 | --- | --- |
-| 镜像 | `tg-ai-bot:latest` |
+| 镜像 | `ghcr.io/zhurui360-dot/tg-ai-bot:latest` |
 | 端口 | `8000` → `8000` |
 | 挂载 | `/vol1/docker/tg-ai-bot/data` → `/app/data` |
-| 环境变量 | `PANEL_PASSWORD`、`TZ=Asia/Shanghai`、需要的 `TG_PROXY` |
+| 环境变量 | `TZ=Asia/Shanghai`、需要的 `TG_PROXY` |
+| 重启策略 | `always` |
 
-**B2. 免构建，直接跑源码**
+数据只在 `/app/data` 里，换镜像升级不影响。
+
+**自动更新**：起一个 watchtower，把它指到容器名上，30 分钟轮询一次，有新镜像就自动重建：
+
+```bash
+docker run -d --name tg-watchtower --restart always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  nickfedor/watchtower --cleanup --interval 1800 tg-ai-bot
+```
+
+之后「改代码 → push main」就是一次发布，不用登 NAS。
+
+> 这条路要求容器**不能挂源码目录**。挂了源码就等于把镜像里的代码覆盖掉，watchtower 换了镜像也没用——这是必须走镜像而非源码挂载的根本原因。
+
+### 路线 B：自己 build
+
+群晖、威联通、fnOS 只要 Docker 能正常用：
+
+```bash
+docker compose up -d --build
+```
+
+### 路线 C：NAS 不能 build 也拉不了镜像
+
+```bash
+docker save ghcr.io/zhurui360-dot/tg-ai-bot:latest | gzip > tg-ai-bot.tar.gz
+```
+
+把 tar 传到 NAS，在面板里「导入镜像」，再按路线 A 的表填。
+
+### 路线 D：免镜像，直接跑源码
 
 把仓库整个目录传到 NAS（比如 `/vol1/docker/tg-ai-bot`），用官方 `python:3.11-slim` 起容器，命令改成：
 
@@ -151,11 +175,20 @@ docker save tg-ai-bot:latest | gzip > tg-ai-bot.tar.gz
 sh /app/nas-start.sh
 ```
 
-这个脚本会做三件事：第一次启动时装依赖（之后用标记文件跳过）、建 `data` 目录、降权到 uid 1000 后启动。
+这个脚本会做三件事：缺依赖时装依赖（真跑一次 import 探测，不是靠标记文件）、建 `data` 目录、降权后启动。
 
-挂载同样要配：`/vol1/docker/tg-ai-bot` → `/app`。**注意这时数据落在 `/app/data`**，也就是 NAS 上的 `tg-ai-bot/data`，别和别的容器混用。
+挂载：`/vol1/docker/tg-ai-bot` → `/app`。**注意这时数据落在 `/app/data`**，别和别的容器混用。
 
-> `nas-start.sh` 里的 `1000` 是 NAS 用户的 uid。如果你的 fnOS / 群晖用户不是 1000，`id` 一下改掉，否则面板写文件会 Permission denied。
+> 这条路无法用 watchtower 自动更新，因为代码来自挂载而不是镜像。要自动更新请走路线 A。
+
+### 踩过的坑（自己改 CI 前先看）
+
+| 现象 | 原因 |
+| --- | --- |
+| 容器 `exit 255` 无限重启 | 镜像是 amd64，NAS 是 arm64。必须多架构构建 |
+| 拉取报 `errno 52428803`，连下载任务都不生成 | buildx 默认带的 attestation manifest 这台 NAS 不认。CI 里设 `provenance: false`、`sbom: false` |
+| 拉取静默失败、无任何报错 | GHCR 包默认私有。CI 里 PATCH 成 public |
+| 容器起来就退，日志还看不到 | `docker-entrypoint.sh` 里用了 `set -e`，`gosu` 降权失败直接退出 |
 
 ---
 
