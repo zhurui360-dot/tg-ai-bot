@@ -1522,9 +1522,22 @@
       var data = await api("/api/update/status");
       state.update = data;
       text("updVersion", "v" + (data.version || "?"));
-      text("updCommit", data.short ? data.short + (data.installed_at ? "（" + data.installed_at + " 升级）" : "") : "镜像内置版本");
+      if (data.pending_restart) {
+        text("updCommit", (data.short || "镜像内置") + "（已下载 " + data.installed_short + "，待重启）");
+      } else {
+        text("updCommit", data.short ? data.short + (data.installed_at ? "（" + data.installed_at + " 升级）" : "") : "镜像内置版本");
+      }
       text("updRepo", data.repo + " @ " + data.branch);
       text("updCheckedAt", data.last_check ? "上次检查 " + data.last_check : "");
+      // 代码下了但没重启，说明上次升级卡在重启环节，提示手动处理
+      if (data.pending_restart) {
+        var box = $("#updateResult");
+        if (box && !box.innerHTML.trim()) {
+          box.innerHTML = notice("warn", "有代码待重启生效",
+            "已下载 " + data.installed_short + "，但当前仍运行 " + (data.short || "镜像内置") +
+            "。重启容器即可生效。");
+        }
+      }
     } catch (err) {
       console.warn("升级状态加载失败", err);
     }
@@ -1574,7 +1587,11 @@
       return;
     }
     var parts = [];
-    if (data.has_update) {
+    if (data.pending_restart) {
+      parts.push(notice("warn", "代码已下载，待重启",
+        "最新代码 " + data.installed_short + " 已在本地，但当前仍运行 " +
+        (data.current_short || "镜像内置") + "。点「立即升级」或重启容器即可生效。"));
+    } else if (data.has_update) {
       parts.push(notice("warn", "发现新版本",
         "线上最新 " + data.remote_commit + "，当前 " + (data.current_short || "镜像内置") +
         (data.remote_message ? "。最新改动：" + data.remote_message : "")));
@@ -1594,46 +1611,108 @@
     if (btn) busy(btn, true);
     var box = $("#updateResult");
     if (box) box.innerHTML = '<p class="dim small mb-0">正在下载代码…（大文件可能要几十秒）</p>';
+    var data;
     try {
-      var data = await api("/api/update/apply");
-      if (!data.ok) {
-        if (box) box.innerHTML = notice("err", data.error || "升级失败", data.hint || "");
-        if (btn) busy(btn, false);
-        return;
-      }
-      if (data.already_latest) {
-        if (box) box.innerHTML = notice("ok", "无需升级", data.message || "已经是最新版本。");
-        if (btn) busy(btn, false);
-        return;
-      }
-      if (box) box.innerHTML = notice("ok", "升级完成", data.message || "服务正在重启，页面会自动刷新。");
-      waitForRestart();
+      // 必须显式 POST：后端这条路由只收 POST，默认 GET 会拿到 405。
+      // 之前漏了这个参数，405 被下面的 catch 当成「重启断连」，界面显示
+      // 「升级完成」而代码一个字节都没换 —— 就是「能检测不能升级」的元凶。
+      data = await api("/api/update/apply", { method: "POST" });
     } catch (err) {
-      // 重启时连接会断，fetch 抛错是正常现象，不当作失败
-      if (box) box.innerHTML = notice("ok", "正在重启", "服务重启中，稍等几秒后页面自动刷新。");
-      waitForRestart();
+      // 只有「服务已经在重启、连接被掐断」才算成功。别的错误必须如实报出来，
+      // 否则用户以为升了级，实际还在跑旧代码。
+      if (err && err.status === 0) {
+        if (box) box.innerHTML = notice("ok", "正在重启", "服务重启中，稍等几秒后页面自动刷新。");
+        waitForRestart(null);
+      } else if (box) {
+        box.innerHTML = notice("err", "升级失败", (err && err.message) || "请求被拒绝。");
+        if (btn) busy(btn, false);
+      }
+      return;
     }
+    if (!data.ok) {
+      if (box) box.innerHTML = notice("err", data.error || "升级失败", data.hint || "");
+      if (btn) busy(btn, false);
+      return;
+    }
+    if (data.already_latest) {
+      if (box) box.innerHTML = notice("ok", "无需升级", data.message || "已经是最新版本。");
+      if (btn) busy(btn, false);
+      return;
+    }
+    if (box) box.innerHTML = notice("ok", data.needs_restart ? "代码已就绪" : "下载完成",
+      data.message || "服务正在重启，页面会自动刷新。");
+    waitForRestart(data.commit || null, btn);
   }
 
-  function waitForRestart() {
+  // 等重启完成，并核对「重启后跑的是不是新版本」。
+  // 只等 /health 变 ok 是不够的：进程可能压根没重启（execv 失败退化成退出），
+  // 服务一直在跑，health 一直 ok，界面就会立刻判定成功并刷新，版本却没变。
+  function waitForRestart(expectShort, btn) {
     var tries = 0;
+    var seenDown = false;
     var timer = setInterval(function () {
       tries++;
       fetch("/health", { cache: "no-store" })
         .then(function (res) { return res.ok ? res.json() : null; })
         .then(function (data) {
-          if (data && data.status === "ok") {
-            clearInterval(timer);
-            toast("升级完成，正在刷新", "ok");
-            setTimeout(function () { location.reload(); }, 800);
-          }
+          if (!data || data.status !== "ok") return;
+          // 第一次成功要先确认服务确实中断过，否则是旧进程在应答
+          if (!seenDown && tries < 3) return;
+          clearInterval(timer);
+          verifyUpgrade(expectShort, btn);
         })
-        .catch(function () { /* 还没起来，继续等 */ });
+        .catch(function () { seenDown = true; /* 连接断了，说明确实在重启 */ });
       if (tries > 40) {
         clearInterval(timer);
         toast("重启超时，请手动刷新页面", "err");
+        if (btn) busy(btn, false);
       }
     }, 1500);
+  }
+
+  // 重启回来后核对「新代码是否真的加载了」。
+  // 只等 /health 变 ok 是不够的：execv 可能压根没执行，旧进程一直在应答，
+  // health 永远 ok，界面就会立刻判定成功并刷新 —— 版本却没变。
+  // 用后端的 pending_restart 判断：「已下载的 commit」和「进程里的 commit」
+  // 是否一致。字符串直接比会踩空值坑（镜像内置版本 running 为空串）。
+  async function verifyUpgrade(expectShort, btn) {
+    var s = null;
+    try {
+      s = await api("/api/update/status");
+    } catch (err) {
+      s = null;
+    }
+    var box = $("#updateResult");
+    if (s && s.pending_restart) {
+      if (box) {
+        box.innerHTML = notice("err", "升级未生效",
+          "新代码已下载（" + (s.installed_short || "") + "），但服务没有重启，" +
+          "仍在运行 " + (s.short || "镜像内置版本") + "。请手动重启容器，或再点一次「立即升级」。");
+      }
+      if (btn) busy(btn, false);
+      return;
+    }
+    var running = s ? (s.short || "").slice(0, 8) : "";
+    var expect = (expectShort || "").slice(0, 8);
+    if (expect && running !== expect) {
+      if (box) {
+        box.innerHTML = notice("err", "升级未生效",
+          "目标版本 " + expect + "，重启后实际运行 " + (running || "镜像内置版本") +
+          "。请手动重启容器后再试。");
+      }
+      if (btn) busy(btn, false);
+      return;
+    }
+    // 成功不再整页刷新：刷新会把这条「升级完成」冲掉，用户只看到页面闪一下。
+    // 就地更新版本行，让人明确看到新版本号。
+    if (box) {
+      box.innerHTML = notice("ok", "升级完成",
+        "已切换到 " + (running || expect) + "，当前就是这个版本在跑。");
+    }
+    if (btn) busy(btn, false);
+    toast("升级完成", "ok");
+    // 版本号那一行要跟着变，否则还显示旧值，看着像没升
+    loadUpdateStatus();
   }
 
   /* ======================================================================

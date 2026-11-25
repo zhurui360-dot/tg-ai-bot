@@ -78,8 +78,18 @@ def write_state(state: dict[str, Any]) -> None:
 
 
 def current_commit() -> str:
-    """当前跑的是哪个提交。安装时写进 state，没有就是镜像自带版本。"""
+    """当前「已安装」的是哪个提交。安装时写进 state，没有就是镜像自带版本。
+
+    注意它不代表「正在跑」的版本：install_code 会立刻把 state 改成新 commit，
+    但新代码要等进程重启才真正加载。要判断实际在跑什么，用 RUNNING_COMMIT。
+    """
     return str(read_state().get("commit", "") or "")
+
+
+# 进程启动那一刻加载的代码版本，模块导入时算一次就不动了。
+# 和 state 里的 commit 会短暂不一致 —— 这段窗口正是「下载完了还没重启」的状态，
+# 前端靠它判断升级到底生效没生效，而不是被 state 骗过去。
+RUNNING_COMMIT: str = current_commit()
 
 
 def _get(url: str, timeout: int = 20) -> bytes:
@@ -106,7 +116,7 @@ def remote_commit(timeout: int = 20) -> dict[str, Any]:
 
 def check() -> dict[str, Any]:
     """检查有没有新版本。返回结构化结果，界面直接渲染。"""
-    local = current_commit()
+    local = RUNNING_COMMIT
     result: dict[str, Any] = {
         "ok": False,
         "repo": REPO,
@@ -132,6 +142,11 @@ def check() -> dict[str, Any]:
     result["remote_commit"] = info["short"]
     result["remote_date"] = info["date"]
     result["remote_message"] = info["message"]
+    installed = current_commit()
+    result["installed_short"] = installed[:8] if installed else ""
+    # 代码已经下好、只是还没重启：这种情况不该再说「发现有新版本」，
+    # 否则用户会反复点升级、每次都在下载同一份。
+    result["pending_restart"] = bool(installed) and installed[:40] == info["sha"] and local[:40] != info["sha"]
     if local:
         result["has_update"] = local[:40] != info["sha"]
     else:
@@ -139,6 +154,9 @@ def check() -> dict[str, Any]:
         # 但用户点升级总能拿到最新版，这里如实说明。
         result["has_update"] = False
         result["note"] = "当前是镜像内置版本，点升级会拉取最新代码。"
+    if result["pending_restart"]:
+        result["has_update"] = True
+        result["note"] = f"最新代码 {info['short']} 已下载，重启容器即可生效。"
 
     state = read_state()
     state["last_check"] = result["checked_at"]
@@ -192,12 +210,24 @@ def install_code() -> dict[str, Any]:
         result["hint"] = "检查容器出网，或在 UPDATE_PROXY 里配代理。"
         return result
 
-    local = current_commit()
+    local = RUNNING_COMMIT
     if local and local[:40] == info["sha"]:
         result["ok"] = True
         result["already_latest"] = True
         result["commit"] = info["short"]
         result["message"] = "已经是最新版本，无需升级。"
+        return result
+
+    # 代码上次已经下好、只是没重启成功：别再下一遍，直接让调用方重启即可。
+    installed = current_commit()
+    if installed and installed[:40] == info["sha"]:
+        result.update({
+            "ok": True,
+            "needs_restart": True,
+            "commit": info["short"],
+            "message": f"{info['short']} 的代码已在本地，重启后生效。",
+        })
+        log.info("代码已是 %s，等待重启", info["short"])
         return result
 
     url = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/{BRANCH}"

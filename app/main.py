@@ -772,17 +772,24 @@ def update_apply(_: None = Depends(require_auth)) -> dict[str, Any]:
         result["restarting"] = True
     return result
 
-
 @app.get("/api/update/status")
 def update_status(_: None = Depends(require_auth)) -> dict[str, Any]:
-    """当前版本、升级历史。"""
+    """当前版本、升级历史。
+
+    「已安装」和「正在跑」分开报：下载完但还没重启时两者不一致，界面要能看出来。
+    """
     state = updater.read_state()
+    installed = str(state.get("commit", "") or "")
+    running = updater.RUNNING_COMMIT
     return {
         "version": __version__,
         "repo": updater.REPO,
         "branch": updater.BRANCH,
-        "commit": state.get("commit", ""),
-        "short": state.get("short", ""),
+        "commit": running,
+        "short": running[:8] if running else "",
+        "installed_commit": installed,
+        "installed_short": installed[:8] if installed else "",
+        "pending_restart": bool(installed) and installed != running,
         "installed_at": state.get("installed_at", ""),
         "last_check": state.get("last_check", ""),
         "code_dir": str(updater.CODE_DIR),
