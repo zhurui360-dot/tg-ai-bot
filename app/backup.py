@@ -1,17 +1,18 @@
-"""GitHub 备份：把配置、机器人、智能体、长期记忆打包成一个 JSON，提交到私有仓库。
+"""WebDAV 备份：把配置、机器人、智能体、长期记忆打包成一个 JSON，传到自己的网盘。
+
+为什么用 WebDAV 而不是 GitHub：
+GitHub 那条路要么让用户建仓库、要么生成带 Contents 写权限的 PAT，两步都在把
+「仓库钥匙」交给一个聊天机器人；而且国内访问 api.github.com 经常要代理。
+WebDAV 是坚果云 / 群晖 / Nextcloud / fnOS 都支持的协议，用户手里基本都有，
+一条 PUT 就能落盘，不需要任何第三方账号授权。
 
 为什么备份不含对话记录：
-对话记录动辄上万条、体积大，而且里面全是聊天原文，推到 GitHub 风险最高
-（哪怕私有仓库，泄露一次就很难收回）。真正难重建的是智能体配置和长期记忆，
-这些加起来通常只有几十 KB，所以只备份它们。
+对话记录动辄上万条、体积大，而且里面全是聊天原文，落到网盘风险最高。
+真正难重建的是智能体配置和长期记忆，这些加起来通常只有几十 KB，所以只备份它们。
 
 为什么备份不含密钥：
-bot token / AI api_key / 面板密码一律不导出，只导出「是否已设置」。
-备份文件会进 git 历史，一旦写进去基本等于永久泄露。恢复后用户重填一次即可。
-
-为什么用 Contents API 而不是 git clone：
-容器里不一定有 git，也没有必要为一次备份拉整个仓库；Contents API 一次 PUT
-就是一个 commit，还能拿到返回的 commit sha，实现上最省事。
+bot token / AI api_key / 面板密码 / WebDAV 密码一律不导出，只导出「是否已设置」。
+备份文件是明文 JSON，一旦传上去就基本等于永久泄露。恢复后用户重填一次即可。
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import base64
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -36,19 +38,35 @@ STATE_FILE = DATA_DIR / "backup-state.json"
 
 # 备份内容里出现这些键就抹掉值，只留「有没有设置」的标记。
 # 注意 ai_agents 表的 api_key 和 bots 表的 token 在下面单独处理。
-# backup_token 必须在列表里：否则会把 GitHub Token 自己备份进仓库，
-# 这个 Token 有 Contents 写权限，等于把仓库钥匙一并交出去。
+#
+# panel_secret 是面板会话的 HMAC 签名密钥。它本身不是密码，但拿到它就能
+# 伪造任意登录 cookie —— 落到网盘上和把面板密码送出去等价，必须抹掉。
+# webdav_pass 同理：备份文件本身就存在这个账号下面，再写密码进去没意义。
 _SECRET_SETTING_KEYS = {
-    "panel_password", "bot_token", "ai_api_key", "ai_proxy", "backup_token",
+    "panel_password", "bot_token", "ai_api_key", "ai_proxy",
+    "panel_secret", "webdav_pass", "backup_token",
 }
 
-# Contents API 单文件上限 100MB，但这么大的 JSON 说明过滤逻辑坏了，
-# 这里直接设一个远低于上限的阈值，超了就报错而不是硬传。
+# 上一版「GitHub 备份」留下的设置键。功能已经删了，但老用户的数据库里还在，
+# 导出时直接丢掉，免得备份文件里带着一堆看不懂又没用的字段。
+_LEGACY_KEYS = {"backup_repo", "backup_branch", "backup_token", "backup_token__set"}
+
+# 打包后的体积上限。超过说明过滤逻辑坏了（比如记忆条数失控），
+# 直接报错比闷头上传一个几十 MB 的文件好。
 _MAX_BYTES = 8 * 1024 * 1024
 
 STATE_LOCK = threading.Lock()
 
 FORMAT_VERSION = 1
+
+# 有些 WebDAV 服务端（坚果云就是）会挡掉 urllib 默认的 User-Agent
+_UA = "tg-ai-bot-backup/1.0"
+
+_PROPFIND_BODY = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>'
+    b"<d:getcontentlength/></d:prop></d:propfind>"
+)
 
 
 def _now() -> str:
@@ -77,28 +95,38 @@ def write_state(state: dict[str, Any]) -> None:
 
 
 # ---------------- 配置项：存在 settings 表里，不是环境变量 ----------------
-# 备份仓库、分支、Token 都从这里读，允许用户在面板里改，不用重启容器。
+# 地址、账号、密码都从这里读，允许用户在面板里改，不用重启容器。
 
 def cfg(key: str, default: str = "") -> str:
     return (db.get_setting(key) or default).strip()
 
 
-def repo() -> str:
-    """目标仓库，形如 user/repo。"""
-    return cfg("backup_repo") or os.getenv("BACKUP_REPO", "").strip()
+def server_url() -> str:
+    """WebDAV 根地址，形如 https://dav.jianguoyun.com/dav/。末尾斜杠会去掉。"""
+    url = cfg("webdav_url") or os.getenv("WEBDAV_URL", "").strip()
+    return url.rstrip("/")
 
 
-def branch() -> str:
-    return cfg("backup_branch") or os.getenv("BACKUP_BRANCH", "").strip() or "main"
+def username() -> str:
+    return cfg("webdav_user") or os.getenv("WEBDAV_USER", "").strip()
 
 
-def path() -> str:
-    """仓库里的文件路径。"""
-    return cfg("backup_path") or "tg-ai-bot-backup.json"
+def password() -> str:
+    return cfg("webdav_pass") or os.getenv("WEBDAV_PASS", "").strip()
 
 
-def token() -> str:
-    return cfg("backup_token") or os.getenv("BACKUP_TOKEN", "").strip()
+def remote_dir() -> str:
+    """目标目录，相对根地址。空表示直接放根目录（用户清空时尊重选择）。"""
+    raw = cfg("webdav_dir")
+    if "webdav_dir" not in db.get_settings():
+        raw = "tg-ai-bot"  # 从没设置过才用默认值，设置成空串是有意的
+    return "/".join(p for p in raw.strip().strip("/").split("/") if p)
+
+
+def filename() -> str:
+    raw = cfg("backup_path") or "tg-ai-bot-backup.json"
+    # 只取最后一段，避免用户填了带目录的路径把 remote_dir 绕过去
+    return raw.strip().split("/")[-1] or "tg-ai-bot-backup.json"
 
 
 def auto_enabled() -> bool:
@@ -113,6 +141,11 @@ def interval_minutes() -> int:
     except (TypeError, ValueError):
         value = 1440
     return max(10, value)
+
+
+def ready() -> bool:
+    """能不能动手：地址、账号、密码齐全。"""
+    return bool(server_url() and username() and password())
 
 
 def _proxy() -> str:
@@ -130,33 +163,92 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener()
 
 
-def _request(url: str, method: str = "GET", body: dict[str, Any] | None = None,
-             timeout: int = 30) -> tuple[int, dict[str, Any]]:
-    """调 GitHub API。返回 (状态码, 解析后的 JSON)。"""
-    data = None
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "tg-ai-bot-backup",
+# ---------------- WebDAV 基础动作 ----------------
+
+def _auth_header() -> str:
+    raw = f"{username()}:{password()}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def _quote(seg: str) -> str:
+    return urllib.parse.quote(seg, safe="")
+
+
+def _path_url(*segments: str) -> str:
+    """拼出某个集合/文件的完整 URL。每段单独转义，中文目录也能用。"""
+    base = server_url()
+    parts = [_quote(s) for s in segments if s]
+    return base + ("/" + "/".join(parts) if parts else "")
+
+
+def _file_url() -> str:
+    return _path_url(remote_dir(), filename())
+
+
+def _request(url: str, method: str = "GET", data: bytes | None = None,
+             headers: dict[str, str] | None = None,
+             timeout: int = 30) -> tuple[int, bytes, dict[str, str]]:
+    """发一个 WebDAV 请求。返回 (状态码, 响应体, 响应头)。"""
+    send: dict[str, str] = {
+        "User-Agent": _UA,
+        "Authorization": _auth_header(),
     }
-    tok = token()
-    if tok:
-        headers["Authorization"] = f"Bearer {tok}"
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    if headers:
+        send.update(headers)
+    req = urllib.request.Request(url, data=data, headers=send, method=method)
     try:
         with _opener().open(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw.strip() else {})
+            return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        try:
-            payload = json.loads(raw) if raw.strip() else {}
-        except json.JSONDecodeError:
-            payload = {"message": raw[:300]}
-        return exc.code, payload
+        return exc.code, exc.read(), dict(exc.headers)
+
+
+def _probe_root() -> tuple[bool, str, str]:
+    """探一下根地址是不是真的 WebDAV。返回 (是否可用, 错误, 建议)。
+
+    单独抽出来是因为 push 和 verify 都要用：不做这一步的话，根地址填错会在
+    MKCOL 那一步变成「403 没有权限」，把「地址错了」误导成「权限问题」——
+    用户会去翻账号设置，而不是改 URL。
+    """
+    try:
+        status, _body, _h = _request(
+            server_url(), method="PROPFIND", data=_PROPFIND_BODY,
+            headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+            timeout=25,
+        )
+    except Exception as exc:
+        return False, f"连不上这个地址：{type(exc).__name__}", \
+            "确认地址能从容器里访问到（带 https:// 或 http://），必要时填代理。"
+
+    if status == 401:
+        return False, "账号或密码不对（HTTP 401）", "坚果云要用「应用密码」，不是登录密码。"
+    if status == 404:
+        return False, "地址不存在（HTTP 404）", \
+            "坚果云是 https://dav.jianguoyun.com/dav/，末尾的 dav 不能少。"
+    if status not in (200, 207):
+        return False, f"这个地址不像 WebDAV（HTTP {status}）", \
+            "确认填的是 WebDAV 入口，不是网盘网页地址。"
+    return True, "", ""
+
+
+def _ensure_dir() -> None:
+    """逐级 MKCOL。已存在返回 405（部分服务端返回 200/301），都算成功。"""
+    segments = [s for s in remote_dir().split("/") if s]
+    for i in range(1, len(segments) + 1):
+        url = _path_url(*segments[:i])
+        status, _body, _h = _request(url, method="MKCOL", timeout=20)
+        # 201 新建成功；405 已存在；301/302 多数是服务端补尾斜杠
+        if status in (200, 201, 204, 301, 302, 405):
+            continue
+        if status == 401:
+            raise PermissionError("账号或密码不对（HTTP 401）")
+        if status == 403:
+            raise PermissionError("这个账号没有在目标目录创建的权限（HTTP 403）")
+        if status == 409:
+            raise RuntimeError("上级目录不存在（HTTP 409），检查根地址是否填对")
+        if status == 404:
+            raise RuntimeError("这个路径在建目录时找不到（HTTP 404），检查根地址是否填对")
+        raise RuntimeError(f"创建目录失败（HTTP {status}）")
 
 
 # ---------------- 打包 / 还原 ----------------
@@ -166,6 +258,8 @@ def build_payload() -> dict[str, Any]:
     settings = db.get_settings()
     safe_settings: dict[str, str] = {}
     for key, value in settings.items():
+        if key in _LEGACY_KEYS:
+            continue
         if key in _SECRET_SETTING_KEYS:
             safe_settings[f"{key}__set"] = "1" if str(value or "").strip() else "0"
             continue
@@ -209,126 +303,133 @@ def build_payload() -> dict[str, Any]:
     }
 
 
-def _encode(payload: dict[str, Any]) -> str:
-    text = json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True)
-    blob = text.encode("utf-8")
+def _encode(payload: dict[str, Any]) -> bytes:
+    blob = json.dumps(payload, ensure_ascii=False, indent=1,
+                      sort_keys=True).encode("utf-8")
     if len(blob) > _MAX_BYTES:
         raise ValueError(f"备份体积 {len(blob) // 1024}KB 超过上限，请减少记忆条数")
-    return base64.b64encode(blob).decode("ascii")
+    return blob
 
 
-def _api_base() -> str:
-    return f"https://api.github.com/repos/{repo()}/contents/{urllib.parse.quote(path())}"
+def _counts(payload: dict[str, Any]) -> dict[str, int]:
+    return {
+        "bots": len(payload.get("bots") or []),
+        "agents": len(payload.get("agents") or []),
+        "notes": len(payload.get("notes") or []),
+    }
 
 
-def _remote_sha() -> str:
-    """取远端文件当前的 sha（更新已有文件时必须带上，否则 422）。"""
-    status, data = _request(_api_base())
-    if status == 200:
-        return str(data.get("sha", "") or "")
-    if status == 404:
-        return ""
-    if status == 401:
-        raise PermissionError("GitHub Token 无效或已过期")
-    if status == 403:
-        raise PermissionError("Token 没有该仓库的写入权限")
-    raise RuntimeError(f"读取远端文件失败（HTTP {status}）")
-
-
-def push(message: str | None = None) -> dict[str, Any]:
-    """把当前配置推到 GitHub。"""
+def push() -> dict[str, Any]:
+    """把当前配置传到 WebDAV。"""
     result: dict[str, Any] = {"ok": False, "at": _now()}
-    if not repo():
-        result["error"] = "还没填备份仓库"
-        result["hint"] = "在「GitHub 备份」里填 owner/repo，或者点「一键创建」自动建一个私有仓库。"
+    if not server_url():
+        result["error"] = "还没填 WebDAV 地址"
+        result["hint"] = "坚果云填 https://dav.jianguoyun.com/dav/，群晖/Nextcloud 填对应的 WebDAV 地址。"
         return result
-    if not token():
-        result["error"] = "还没填 GitHub Token"
-        result["hint"] = "点「一键直达 GitHub」创建带权限的 Token，粘贴回来即可。"
+    if not username() or not password():
+        result["error"] = "还没填账号或密码"
+        result["hint"] = "坚果云要用「应用密码」，不是登录密码；在账户信息 → 安全选项中生成。"
         return result
 
     try:
         payload = build_payload()
-        content = _encode(payload)
+        blob = _encode(payload)
     except Exception as exc:
         result["error"] = f"打包失败：{exc}"
         return result
 
+    # 先确认根地址真的是 WebDAV，否则后面 MKCOL 的 404 会被误读成权限问题
+    ok, err, hint = _probe_root()
+    if not ok:
+        result["error"] = err
+        result["hint"] = hint
+        return result
+
     try:
-        sha = _remote_sha()
+        _ensure_dir()
     except PermissionError as exc:
         result["error"] = str(exc)
-        result["hint"] = "重新生成一个带 Contents: Read and write 权限的 Token。"
+        return result
+    except RuntimeError as exc:
+        # 服务端明确回了个错，不是网络问题，别提示用户去查代理
+        result["error"] = str(exc)
+        result["hint"] = "确认地址指向 WebDAV 入口，不是网盘首页。"
         return result
     except Exception as exc:
-        result["error"] = f"连不上 GitHub：{type(exc).__name__}"
-        result["hint"] = "容器出网受限时，在「代理」里填 HTTP 代理地址。"
-        log.warning("备份读取远端失败：%s", exc)
+        result["error"] = f"连不上 WebDAV：{type(exc).__name__}"
+        result["hint"] = "地址要能直连；容器出网受限时在「代理」里填 HTTP 代理。"
+        log.warning("备份建目录失败：%s", exc)
         return result
 
-    body: dict[str, Any] = {
-        "message": message or f"backup: {payload['exported_at']}",
-        "content": content,
-        "branch": branch(),
-    }
-    if sha:
-        body["sha"] = sha
-
+    url = _file_url()
     try:
-        status, data = _request(_api_base(), method="PUT", body=body, timeout=60)
+        status, body, headers = _request(
+            url, method="PUT", data=blob,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=60,
+        )
     except Exception as exc:
         result["error"] = f"上传失败：{type(exc).__name__}"
         result["hint"] = "检查容器出网，或配置代理。"
         log.warning("备份上传失败：%s", exc)
         return result
 
-    if status in (200, 201):
-        commit = (data.get("commit") or {}).get("sha", "")
+    # 200 覆盖成功 / 201 新建 / 204 无内容返回，都是成功
+    if status in (200, 201, 204):
+        etag = (headers.get("ETag") or headers.get("etag") or "").strip('"')
         result.update({
             "ok": True,
-            "commit": commit[:8],
-            "url": (data.get("content") or {}).get("html_url", ""),
-            "counts": {
-                "bots": len(payload["bots"]),
-                "agents": len(payload["agents"]),
-                "notes": len(payload["notes"]),
-            },
-            "bytes": len(content) * 3 // 4,
-            "message": "已备份到 GitHub。",
+            "path": f"{remote_dir()}/{filename()}".lstrip("/"),
+            "etag": etag[:16],
+            "counts": _counts(payload),
+            "bytes": len(blob),
+            "message": "已备份到 WebDAV。",
         })
         state = read_state()
         state.update({
             "last_push_at": result["at"],
-            "last_commit": commit[:8],
+            "last_etag": etag[:16],
+            "last_bytes": len(blob),
             "last_ok": True,
-            "repo": repo(),
-            "branch": branch(),
+            "url": server_url(),
+            "dir": remote_dir(),
         })
         write_state(state)
-        log.info("备份已推送：%s %s", repo(), commit[:8])
+        log.info("备份已上传：%s（%d 字节）", url, len(blob))
         return result
 
-    detail = str(data.get("message", "") or "")[:200]
-    result["error"] = f"GitHub 拒绝写入（HTTP {status}）"
-    result["hint"] = detail or "确认 Token 有 Contents 写权限，且仓库/分支存在。"
+    if status == 401:
+        result["error"] = "账号或密码不对（HTTP 401）"
+        result["hint"] = "坚果云必须用应用密码；其他网盘确认没开二次验证拦截。"
+    elif status == 403:
+        result["error"] = "没有写入权限（HTTP 403）"
+        result["hint"] = "账号没有这个目录的写权限，换个目录或换个账号。"
+    elif status == 507:
+        result["error"] = "网盘空间不足（HTTP 507）"
+    else:
+        detail = body.decode("utf-8", "replace")[:200] if body else ""
+        result["error"] = f"上传被拒绝（HTTP {status}）"
+        if detail:
+            result["hint"] = re.sub(r"<[^>]+>", " ", detail).strip()[:160]
     return result
 
 
 def fetch_remote() -> dict[str, Any]:
-    """从 GitHub 取回备份内容（不落盘）。"""
-    if not repo() or not token():
-        return {"ok": False, "error": "备份仓库或 Token 未配置"}
+    """从 WebDAV 取回备份内容（不落盘）。"""
+    if not ready():
+        return {"ok": False, "error": "WebDAV 地址、账号或密码未配置"}
     try:
-        status, data = _request(_api_base())
+        status, body, _h = _request(_file_url(), method="GET", timeout=45)
     except Exception as exc:
-        return {"ok": False, "error": f"连不上 GitHub：{type(exc).__name__}"}
+        return {"ok": False, "error": f"连不上 WebDAV：{type(exc).__name__}"}
     if status == 404:
-        return {"ok": False, "error": "远端还没有备份文件"}
+        return {"ok": False, "error": "网盘上还没有备份文件"}
+    if status == 401:
+        return {"ok": False, "error": "账号或密码不对（HTTP 401）"}
     if status != 200:
         return {"ok": False, "error": f"读取失败（HTTP {status}）"}
-    raw = str(data.get("content", "") or "").replace("\n", "")
     try:
-        payload = json.loads(base64.b64decode(raw).decode("utf-8"))
+        payload = json.loads(body.decode("utf-8"))
     except Exception as exc:
         return {"ok": False, "error": f"备份文件不是合法 JSON：{exc}"}
     if not isinstance(payload, dict) or payload.get("app") != "tg-ai-bot":
@@ -336,12 +437,9 @@ def fetch_remote() -> dict[str, Any]:
     return {
         "ok": True,
         "payload": payload,
-        "counts": {
-            "bots": len(payload.get("bots") or []),
-            "agents": len(payload.get("agents") or []),
-            "notes": len(payload.get("notes") or []),
-        },
+        "counts": _counts(payload),
         "exported_at": payload.get("exported_at", ""),
+        "bytes": len(body),
     }
 
 
@@ -354,7 +452,7 @@ def restore(payload: dict[str, Any]) -> dict[str, Any]:
     applied = {"settings": 0, "agents": 0, "notes": 0, "bots": 0}
     try:
         for key, value in (payload.get("settings") or {}).items():
-            if key.endswith("__set") or key in _SECRET_SETTING_KEYS:
+            if key.endswith("__set") or key in _SECRET_SETTING_KEYS or key in _LEGACY_KEYS:
                 continue  # 密钥类跳过，不让备份覆盖本地凭据
             db.set_setting(key, value)
             applied["settings"] += 1
@@ -401,131 +499,92 @@ def restore(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "applied": applied, "message": "已从备份恢复，密钥需重新填写。"}
 
 
-# ---------------- Token 创建链接 ----------------
+# ---------------- 连通性校验 ----------------
 
-def token_url() -> str:
-    """生成「已勾好权限」的 GitHub Token 创建链接。
+def verify() -> dict[str, Any]:
+    """校验连接：探测根地址 → 建目录 → 写一个探针文件再删掉。
 
-    GitHub 的 fine-grained token 页面支持用 URL 参数预填字段（官方文档
-    「在 URL 中预填细粒度个人访问令牌详情」）。备份只需要一个权限：
-    Contents = Read and write（读写仓库文件）。Metadata 由 GitHub 自动附带。
-    仓库选择没法用 URL 指定，所以 description 里写清楚该选哪个仓库。
+    只做 PROPFIND 不足以说明问题：地址对、密码对，但没有写权限的话，
+    备份照样会失败。所以最后要真写一次。
     """
-    target = ""
-    if repo() and "/" in repo():
-        target = repo().split("/", 1)[0]
+    if not server_url():
+        return {"ok": False, "error": "还没填 WebDAV 地址"}
+    if not username() or not password():
+        return {"ok": False, "error": "还没填账号或密码"}
 
-    desc = "TG AI 机器人配置备份，只需要 Contents 读写权限"
-    if repo():
-        desc = f"TG AI 机器人配置备份（{repo()}），只需要 Contents 读写权限"
-    params = {
-        "name": "tg-ai-bot-backup",
-        "description": desc,
-        "expires_in": "90",
-        "contents": "write",
-    }
-    if target:
-        params["target_name"] = target
-    return "https://github.com/settings/personal-access-tokens/new?" + urllib.parse.urlencode(params)
+    steps: list[dict[str, str]] = []
 
+    ok, err, hint = _probe_root()
+    if not ok:
+        return {"ok": False, "error": err, "hint": hint, "steps": steps}
+    steps.append({"step": "连接", "state": "ok", "detail": "WebDAV 可用"})
 
-def verify_token() -> dict[str, Any]:
-    """校验 Token 是否可用、有没有写权限，并返回账号信息。"""
-    if not token():
-        return {"ok": False, "error": "还没填 Token"}
     try:
-        status, data = _request("https://api.github.com/user", timeout=20)
+        _ensure_dir()
+    except PermissionError as exc:
+        return {"ok": False, "error": str(exc), "steps": steps}
     except Exception as exc:
-        return {"ok": False, "error": f"连不上 GitHub：{type(exc).__name__}"}
-    if status == 401:
-        return {"ok": False, "error": "Token 无效或已过期"}
-    if status != 200:
-        return {"ok": False, "error": f"校验失败（HTTP {status}）"}
+        return {"ok": False, "error": str(exc), "steps": steps}
+    steps.append({"step": "目录", "state": "ok",
+                  "detail": remote_dir() or "（根目录）"})
 
-    info: dict[str, Any] = {
+    # 真写一次，确认有写权限
+    probe_url = _path_url(remote_dir(), "." + filename() + ".probe")
+    try:
+        status, _b, _h = _request(
+            probe_url, method="PUT", data=b"ok",
+            headers={"Content-Type": "text/plain"}, timeout=25,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"写入测试失败：{type(exc).__name__}", "steps": steps}
+    if status not in (200, 201, 204):
+        if status == 401:
+            msg = "账号或密码不对（HTTP 401）"
+        elif status == 403:
+            msg = "这个账号没有写入权限（HTTP 403）"
+        else:
+            msg = f"写入测试失败（HTTP {status}）"
+        return {"ok": False, "error": msg, "hint": "只能读不能写的账号做不了备份。",
+                "steps": steps}
+    steps.append({"step": "写入", "state": "ok", "detail": "探针文件已写入"})
+
+    # 删掉探针，不留在用户网盘里
+    try:
+        _request(probe_url, method="DELETE", timeout=20)
+    except Exception:
+        pass
+
+    return {
         "ok": True,
-        "login": data.get("login", ""),
-        "name": data.get("name", ""),
-        "scopes": [],
+        "steps": steps,
+        "target": f"{remote_dir()}/{filename()}".lstrip("/"),
+        "message": "连接正常，可以写入。",
     }
-    if not repo():
-        info["hint"] = "Token 有效。接下来填备份仓库（owner/repo），或点「创建私有仓库」。"
-        return info
-
-    try:
-        status, rdata = _request(f"https://api.github.com/repos/{repo()}")
-        if status == 404:
-            info["repo_ok"] = False
-            info["hint"] = "Token 有效，但访问不到这个仓库。确认仓库名正确、Token 有该仓库权限。"
-            return info
-        if status != 200:
-            info.update({"repo_ok": False, "hint": f"读取仓库失败（HTTP {status}）"})
-            return info
-        info["repo_ok"] = True
-        info["repo_private"] = bool(rdata.get("private"))
-        info["can_push"] = bool((rdata.get("permissions") or {}).get("push"))
-        if info["repo_private"] is False:
-            info["warn"] = "这个仓库是公开的，备份内容（含聊天记忆）会被人看到，建议改成私有。"
-        elif not info["can_push"]:
-            info["warn"] = "Token 对这个仓库似乎没有写权限，备份会失败。"
-    except Exception as exc:
-        info["hint"] = f"检查仓库时出错：{type(exc).__name__}"
-    return info
-
-
-def create_repo(name: str, private: bool = True) -> dict[str, Any]:
-    """建一个私有仓库，省得用户跳出去手动建。"""
-    if not token():
-        return {"ok": False, "error": "需要先填 Token"}
-    if not name:
-        return {"ok": False, "error": "仓库名不能为空"}
-    name = name.strip()
-    if "/" in name:
-        return {"ok": False, "error": "只填仓库名就行，不要带 owner/"}
-    body = {
-        "name": name,
-        "private": bool(private),
-        "auto_init": True,  # 带 README，这样后面 PUT 文件时分支一定存在
-        "description": "TG AI 机器人配置备份（自动生成）",
-    }
-    try:
-        status, data = _request("https://api.github.com/user/repos", method="POST", body=body, timeout=45)
-    except Exception as exc:
-        return {"ok": False, "error": f"连不上 GitHub：{type(exc).__name__}"}
-    if status == 201:
-        full = str(data.get("full_name", "") or "")
-        if full:
-            db.set_setting("backup_repo", full)
-            db.set_setting("backup_branch", str(data.get("default_branch") or "main"))
-        return {"ok": True, "repo": full, "url": data.get("html_url", ""), "private": bool(data.get("private"))}
-    msg = str(data.get("message", "") or "")[:160]
-    if status == 422:
-        return {"ok": False, "error": "仓库已存在，或名字不合法", "hint": msg}
-    return {"ok": False, "error": f"创建失败（HTTP {status}）", "hint": msg}
 
 
 def status() -> dict[str, Any]:
     """面板展示用。"""
     state = read_state()
     return {
-        "configured": bool(repo() and token()),
-        "has_token": bool(token()),
-        "repo": repo(),
-        "branch": branch(),
-        "path": path(),
+        "configured": ready(),
+        "url": server_url(),
+        "user": username(),
+        "has_password": bool(password()),
+        "dir": remote_dir(),
+        "path": f"{remote_dir()}/{filename()}".lstrip("/"),
         "auto": auto_enabled(),
         "interval": interval_minutes(),
         "proxy": cfg("backup_proxy"),
         "last_push_at": state.get("last_push_at", ""),
-        "last_commit": state.get("last_commit", ""),
-        "token_url": token_url(),
+        "last_etag": state.get("last_etag", ""),
+        "last_bytes": state.get("last_bytes", 0),
     }
 
 
 # ---------------- 自动备份 ----------------
 
 class AutoBackup:
-    """后台线程：按间隔自动推一次。失败不重试，等下一轮。"""
+    """后台线程：按间隔自动传一次。失败不重试，等下一轮。"""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -546,17 +605,17 @@ class AutoBackup:
         # 启动后先等一会儿，别和机器人启动抢资源
         if self._stop.wait(30):
             return
-        # 以启动时刻为起点：否则 time.time() - 0 恒大于间隔，一启动就会推一次
+        # 以启动时刻为起点：否则 time.time() - 0 恒大于间隔，一启动就会传一次
         self._last = time.time()
         while not self._stop.is_set():
             try:
-                if auto_enabled() and token() and repo():
+                if auto_enabled() and ready():
                     due = time.time() - self._last
                     if due >= interval_minutes() * 60:
-                        result = push("backup: auto")
+                        result = push()
                         self._last = time.time()
                         if result.get("ok"):
-                            log.info("自动备份完成：%s", result.get("commit", ""))
+                            log.info("自动备份完成：%s", result.get("path", ""))
                         else:
                             log.warning("自动备份失败：%s", result.get("error"))
             except Exception as exc:

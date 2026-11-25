@@ -1637,7 +1637,7 @@
   }
 
   /* ======================================================================
-     13. GitHub 备份
+     13. WebDAV 备份
      ====================================================================== */
 
   async function loadBackupStatus() {
@@ -1652,33 +1652,30 @@
 
   function fillBackupForm(s) {
     if (!s) return;
-    // Token 永远不回显：输入框只用来「填新的」，已有就提示已保存
-    var input = $("#bkToken");
-    if (input) {
-      input.value = "";
-      input.placeholder = s.has_token ? "已保存，留空则不修改" : "ghp_… / github_pat_…";
+    // 密码永远不回显：输入框只用来「填新的」，已有就提示已保存
+    var pass = $("#bkPass");
+    if (pass) {
+      pass.value = "";
+      pass.placeholder = s.has_password ? "已保存，留空不修改" : "应用密码";
     }
-    if ($("#bkRepo")) $("#bkRepo").value = s.repo || "";
-    if ($("#bkBranch")) $("#bkBranch").value = s.branch || "main";
-    if ($("#bkPath")) $("#bkPath").value = s.path || "";
+    if ($("#bkUrl")) $("#bkUrl").value = s.url || "";
+    if ($("#bkUser")) $("#bkUser").value = s.user || "";
+    if ($("#bkDir")) $("#bkDir").value = s.dir || "";
+    if ($("#bkPath")) $("#bkPath").value = s.path ? s.path.split("/").pop() : "";
     if ($("#bkProxy")) $("#bkProxy").value = s.proxy || "";
     if ($("#bkAuto")) $("#bkAuto").checked = !!s.auto;
     if ($("#bkInterval")) $("#bkInterval").value = s.interval || 1440;
 
-    // 「一键直达」的链接带上当前仓库名，GitHub 页面能少填一项
-    var link = $("#bkTokenLink");
-    if (link && s.token_url) link.href = s.token_url;
-
     text("bkLast", s.last_push_at || "还没备份过");
-    text("bkCommit", s.last_commit || "—");
+    text("bkRemote", s.path || "—");
 
     var badge = $("#bkStatus");
     if (badge) {
       if (s.configured) {
-        badge.textContent = "已连接 " + s.repo;
+        badge.textContent = "已配置 · " + s.path;
         badge.className = "dim small";
-      } else if (s.has_token) {
-        badge.textContent = "还差仓库地址";
+      } else if (s.url || s.user) {
+        badge.textContent = "还差地址或密码";
         badge.className = "dim small";
       } else {
         badge.textContent = "还没配置";
@@ -1695,15 +1692,16 @@
 
   function backupPayload() {
     var body = {
-      repo: val("bkRepo").trim(),
-      branch: val("bkBranch").trim() || "main",
+      url: val("bkUrl").trim(),
+      user: val("bkUser").trim(),
+      dir: val("bkDir").trim(),
       path: val("bkPath").trim() || "tg-ai-bot-backup.json",
       auto: $("#bkAuto") && $("#bkAuto").checked ? "1" : "0",
       interval: val("bkInterval").trim() || "1440",
       proxy: val("bkProxy").trim()
     };
-    var token = val("bkToken").trim();
-    if (token) body.token = token;  // 留空 = 不改
+    var pass = val("bkPass").trim();
+    if (pass) body.password = pass;  // 留空 = 不改
     return body;
   }
 
@@ -1726,60 +1724,28 @@
   async function verifyBackup(btn) {
     if (btn) busy(btn, true);
     var box = $("#backupResult");
-    if (box) box.innerHTML = '<p class="dim small mb-0">正在连接 GitHub…</p>';
+    if (box) box.innerHTML = '<p class="dim small mb-0">正在连接 WebDAV…</p>';
     try {
-      // 先把当前输入存下来，否则用户刚粘贴的 Token 校验时会用旧值
+      // 先把当前输入存下来，否则用户刚粘贴的密码校验时会用旧值
       var saved = await saveBackupConfig(null);
       var data = await api("/api/backup/verify", { method: "POST" });
       if (!data.ok) {
         if (box) box.innerHTML = notice("err", data.error || "校验失败", data.hint || "");
         return;
       }
+      var steps = (data.steps || []).map(function (s) {
+        return esc(s.step);
+      }).join(" → ");
       var bits = [];
       bits.push(notice("ok", "连接正常",
-        "账号 " + (data.login || "?") +
-        (data.repo_ok === true ? "，仓库可写。" : "") +
-        (data.repo_ok === false ? "，但仓库访问不了。" : "")));
-      if (data.warn) bits.push(notice("warn", "注意", data.warn));
-      if (data.hint) bits.push('<p class="dim small mb-0">' + esc(data.hint) + "</p>");
+        "已确认能写入。" + (data.target ? "备份会存到 " + data.target : "")));
+      if (steps) {
+        bits.push('<p class="dim small mb-0">已通过：' + steps + "</p>");
+      }
       if (box) box.innerHTML = bits.join("");
       if (saved) fillBackupForm(saved);
     } catch (err) {
       if (box) box.innerHTML = notice("err", "校验失败", err.message);
-    } finally {
-      if (btn) busy(btn, false);
-    }
-  }
-
-  async function createBackupRepo(btn) {
-    var repo = ($("#bkRepo").value || "").trim();
-    var name = repo && repo.indexOf("/") < 0 ? repo : "";
-    var answer = await promptDialog({
-      title: "新建私有仓库",
-      label: "仓库名（只填名字，不要带 owner/）",
-      value: name || "tg-ai-bot-backup",
-      okText: "创建"
-    });
-    if (answer === null) return;
-    name = String(answer || "").trim();
-    if (!name) {
-      toast("填个仓库名", "err");
-      return;
-    }
-    if (btn) busy(btn, true);
-    try {
-      // 建仓库要用到 Token，先保存再建
-      await saveBackupConfig(null);
-      var data = await api("/api/backup/create-repo", { method: "POST", body: { name: name } });
-      toast("已创建 " + data.repo, "ok");
-      await loadBackupStatus();
-      var box = $("#backupResult");
-      if (box) {
-        box.innerHTML = notice("ok", "仓库已就绪",
-          data.repo + (data.private ? "（私有）" : "（公开）") + "，现在可以点「立即备份」了。");
-      }
-    } catch (err) {
-      toast(err.message, "err");
     } finally {
       if (btn) busy(btn, false);
     }
@@ -1799,12 +1765,56 @@
       var c = data.counts || {};
       if (box) {
         box.innerHTML = notice("ok", "备份完成",
-          "已推送 " + data.commit + "（" + (c.bots || 0) + " 个机器人、" +
-          (c.agents || 0) + " 个智能体、" + (c.notes || 0) + " 条记忆）。");
+          "已上传 " + kbSize(data.bytes) + " 到 " + esc(data.path) +
+          "（" + (c.bots || 0) + " 个机器人、" + (c.agents || 0) + " 个智能体、" +
+          (c.notes || 0) + " 条记忆）。");
       }
       await loadBackupStatus();
     } catch (err) {
       if (box) box.innerHTML = notice("err", "备份失败", err.message);
+    } finally {
+      if (btn) busy(btn, false);
+    }
+  }
+
+  function kbSize(bytes) {
+    var n = Number(bytes) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(2) + " MB";
+  }
+
+  async function restoreBackup(btn) {
+    if (btn) busy(btn, true);
+    var box = $("#backupResult");
+    try {
+      await saveBackupConfig(null);
+      var preview = await api("/api/backup/preview");
+      if (!preview.ok) {
+        if (box) box.innerHTML = notice("err", preview.error || "读取备份失败", preview.hint || "");
+        return;
+      }
+      var c = preview.counts || {};
+      var ok = await confirmDialog({
+        title: "从备份恢复？",
+        message: "备份时间 " + (preview.exported_at || "未知") + "，包含 " +
+          (c.bots || 0) + " 个机器人、" + (c.agents || 0) + " 个智能体、" +
+          (c.notes || 0) + " 条记忆。会覆盖同名的智能体配置，记忆只增不重。" +
+          "备份里没有密钥，恢复后要重填 Bot Token 与 AI Key。",
+        okText: "恢复"
+      });
+      if (!ok) return;
+      var data = await api("/api/backup/restore", { method: "POST" });
+      var a = data.applied || {};
+      if (box) {
+        box.innerHTML = notice("ok", "恢复完成",
+          "配置 " + (a.settings || 0) + " 项、智能体 " + (a.agents || 0) +
+          " 个、记忆 " + (a.notes || 0) + " 条。" + (data.message || ""));
+      }
+      toast("已恢复，正在刷新", "ok");
+      setTimeout(function () { location.reload(); }, 1200);
+    } catch (err) {
+      if (box) box.innerHTML = notice("err", "恢复失败", err.message);
     } finally {
       if (btn) busy(btn, false);
     }
@@ -1947,7 +1957,6 @@
     "backup-push": pushBackup,
     "backup-verify": verifyBackup,
     "backup-restore": restoreBackup,
-    "backup-create-repo": createBackupRepo,
     "clear-messages": clearMessages,
     messages: openMessages,
     logout: logout,

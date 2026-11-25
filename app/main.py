@@ -788,10 +788,10 @@ def update_status(_: None = Depends(require_auth)) -> dict[str, Any]:
         "code_dir": str(updater.CODE_DIR),
     }
 
-# ---------------- GitHub 备份 ----------------
+# ---------------- WebDAV 备份 ----------------
 #
 # 备份只导出「配置 / 智能体 / 记忆」，不含对话记录与任何密钥。
-# 密钥进 git 历史等于永久泄露，所以恢复后需要重填一次。
+# 备份是明文 JSON，落在网盘上等于长期可读，所以恢复后需要重填一次密钥。
 
 @app.get("/api/backup/status")
 def backup_status(_: None = Depends(require_auth)) -> dict[str, Any]:
@@ -800,20 +800,23 @@ def backup_status(_: None = Depends(require_auth)) -> dict[str, Any]:
 
 @app.put("/api/backup/config")
 def backup_config(body: dict[str, Any], _: None = Depends(require_auth)) -> dict[str, Any]:
-    """保存备份配置。Token 留空表示不修改。"""
-    if "repo" in body:
-        value = str(body.get("repo", "")).strip()
-        if value and ("/" not in value or value.count("/") != 1):
-            raise HTTPException(status_code=400, detail="仓库要写成 owner/repo")
-        db.set_setting("backup_repo", value)
-    if "branch" in body:
-        db.set_setting("backup_branch", str(body.get("branch", "")).strip() or "main")
+    """保存备份配置。密码留空表示不修改。"""
+    if "url" in body:
+        value = str(body.get("url", "")).strip()
+        if value and not value.lower().startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="地址要带 http:// 或 https://")
+        db.set_setting("webdav_url", value.rstrip("/"))
+    if "user" in body:
+        db.set_setting("webdav_user", str(body.get("user", "")).strip())
+    if "password" in body:
+        value = str(body.get("password", "")).strip()
+        if value:  # 留空 = 不改，避免面板只显示星号时把密码清掉
+            db.set_setting("webdav_pass", value)
+    if "dir" in body:
+        # 允许留空：用户明确想放根目录时，不能强行塞个默认值回去
+        db.set_setting("webdav_dir", str(body.get("dir", "")).strip().strip("/"))
     if "path" in body:
         db.set_setting("backup_path", str(body.get("path", "")).strip() or "tg-ai-bot-backup.json")
-    if "token" in body:
-        value = str(body.get("token", "")).strip()
-        if value:
-            db.set_setting("backup_token", value)
     if "auto" in body:
         db.set_setting("backup_auto", "1" if str(body.get("auto")) in ("1", "true", "True") else "0")
     if "interval" in body:
@@ -829,17 +832,8 @@ def backup_config(body: dict[str, Any], _: None = Depends(require_auth)) -> dict
 
 @app.post("/api/backup/verify")
 def backup_verify(_: None = Depends(require_auth)) -> dict[str, Any]:
-    """校验 Token 与仓库权限，顺带当出网探针。"""
-    return backup.verify_token()
-
-
-@app.post("/api/backup/create-repo")
-def backup_create_repo(body: dict[str, Any], _: None = Depends(require_auth)) -> dict[str, Any]:
-    name = str(body.get("name", "")).strip()
-    result = backup.create_repo(name, private=True)
-    if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=result.get("error") or "创建失败")
-    return result
+    """校验连接：探地址、建目录、写探针再删掉。"""
+    return backup.verify()
 
 
 @app.post("/api/backup/push")

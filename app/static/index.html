@@ -294,38 +294,35 @@
       </div>
 
       <div class="card">
-        <div class="card-head"><div><h3>GitHub 备份</h3><p class="sub">把配置、智能体、长期记忆存到私有仓库</p></div></div>
+        <div class="card-head"><div><h3>WebDAV 备份</h3><p class="sub">把配置、智能体、长期记忆存到自己的网盘</p></div></div>
         <div class="card-body">
           <div class="bk-steps">
             <div class="bk-step">
               <div class="bk-num">1</div>
               <div class="bk-info">
-                <div class="strong small">创建访问 Token</div>
-                <div class="dim tiny">链接已自动勾选 <b>Contents: Read and write</b>，这是备份唯一需要的权限。</div>
+                <div class="strong small">填 WebDAV 地址</div>
+                <div class="dim tiny" id="bkUrlHint">坚果云用 <code class="mono">https://dav.jianguoyun.com/dav/</code>，群晖 / Nextcloud 填各自的 WebDAV 入口。</div>
               </div>
-              <a class="btn sm" id="bkTokenLink" href="https://github.com/settings/personal-access-tokens/new?name=tg-ai-bot-backup&contents=write&expires_in=90" target="_blank" rel="noopener noreferrer">
-                一键直达 GitHub
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/></svg>
-              </a>
+              <input class="input" id="bkUrl" placeholder="https://dav.jianguoyun.com/dav/" autocomplete="off" style="max-width:320px">
             </div>
             <div class="bk-step">
               <div class="bk-num">2</div>
               <div class="bk-info">
-                <div class="strong small">粘贴 Token</div>
-                <div class="dim tiny">以 <code class="mono">github_pat_</code> 或 <code class="mono">ghp_</code> 开头，创建后只显示一次。</div>
+                <div class="strong small">账号与应用密码</div>
+                <div class="dim tiny">坚果云必须用「应用密码」（账户信息 → 安全选项 → 添加应用），登录密码会被拒。</div>
               </div>
-              <input class="input" id="bkToken" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" style="max-width:260px">
+              <div class="row" style="gap:8px">
+                <input class="input" id="bkUser" placeholder="账号 / 邮箱" autocomplete="off" style="max-width:160px">
+                <input class="input" id="bkPass" type="password" placeholder="应用密码" autocomplete="new-password" style="max-width:160px">
+              </div>
             </div>
             <div class="bk-step">
               <div class="bk-num">3</div>
               <div class="bk-info">
-                <div class="strong small">选择备份仓库</div>
-                <div class="dim tiny" id="bkRepoHint">填 <code class="mono">owner/repo</code>，或直接建一个新的私有仓库。</div>
+                <div class="strong small">选择存放目录</div>
+                <div class="dim tiny" id="bkDirHint">相对上面地址的路径，不存在会自动创建。留空则放在根目录。</div>
               </div>
-              <div class="row">
-                <input class="input" id="bkRepo" placeholder="owner/repo" style="max-width:200px">
-                <button class="btn sm" data-act="backup-create-repo">建私有仓库</button>
-              </div>
+              <input class="input" id="bkDir" placeholder="tg-ai-bot" style="max-width:200px">
             </div>
           </div>
 
@@ -333,11 +330,7 @@
             <summary>高级选项</summary>
             <div class="grid-3 mt-12">
               <div class="field">
-                <label>分支</label>
-                <input class="input" id="bkBranch" placeholder="main">
-              </div>
-              <div class="field">
-                <label>文件路径</label>
+                <label>文件名</label>
                 <input class="input" id="bkPath" placeholder="tg-ai-bot-backup.json">
               </div>
               <div class="field">
@@ -361,7 +354,7 @@
 
           <dl class="kv mt-16">
             <dt>上次备份</dt><dd id="bkLast">—</dd>
-            <dt>提交</dt><dd id="bkCommit" class="mono">—</dd>
+            <dt>保存位置</dt><dd id="bkRemote" class="mono">—</dd>
             <dt>备份内容</dt><dd class="dim small">配置 · 智能体 · 长期记忆（不含对话记录与密钥）</dd>
           </dl>
           <div id="backupResult"></div>

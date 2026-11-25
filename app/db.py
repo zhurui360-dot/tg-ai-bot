@@ -46,11 +46,12 @@ DEFAULTS: dict[str, str] = {
     "panel_title": os.getenv("APP_TITLE", "").strip() or "TG AI 机器人",
     "known_chats": "",       # 机器人待过的群（JSON）
     "business_connections": "",
-    # ---------- GitHub 备份 ----------
-    "backup_repo": os.getenv("BACKUP_REPO", "").strip(),      # owner/repo
-    "backup_branch": os.getenv("BACKUP_BRANCH", "").strip() or "main",
-    "backup_path": "tg-ai-bot-backup.json",
-    "backup_token": os.getenv("BACKUP_TOKEN", "").strip(),
+    # ---------- WebDAV 备份 ----------
+    "webdav_url": os.getenv("WEBDAV_URL", "").strip(),        # https://dav.jianguoyun.com/dav
+    "webdav_user": os.getenv("WEBDAV_USER", "").strip(),
+    "webdav_pass": os.getenv("WEBDAV_PASS", "").strip(),      # 坚果云要应用密码
+    "webdav_dir": "tg-ai-bot",   # 相对根地址的目录，不存在会自动建
+    "backup_path": "tg-ai-bot-backup.json",   # 文件名
     "backup_auto": "0",      # 1 = 定时自动备份
     "backup_interval": "1440",  # 分钟，默认一天
     "backup_proxy": "",
