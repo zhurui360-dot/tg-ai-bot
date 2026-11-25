@@ -5,10 +5,12 @@ set -e
 
 cd /app
 
-# 依赖只装一次；已装过时 pip 会很快跳过
-if [ ! -f /app/.deps-ok ]; then
+# 依赖判断不能靠标记文件：依赖装在容器内，标记文件却落在挂载卷上。
+# 换一个新容器复用旧卷时会跳过安装，然后因为找不到 fastapi 直接崩溃。
+# 这里改成「真的能 import 才算装好」，跨容器、跨版本都安全。
+if ! python -c "import fastapi, uvicorn, socks" >/dev/null 2>&1; then
+    echo "[nas-start] 安装依赖..."
     pip install --no-cache-dir -r /app/requirements.txt
-    touch /app/.deps-ok
 fi
 
 # 数据目录：容器以 root 启动，装完依赖后降权到 1000 运行，
