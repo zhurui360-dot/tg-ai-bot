@@ -165,6 +165,13 @@ _runtimes: dict[int, dict[str, Any]] = {}
 
 DEFAULT_RUNTIME_KEY = 0
 
+# 长轮询的挂起时长。Telegram 侧在这个时间内会一直占用该 Token 的更新流，
+# 期间任何新的 getUpdates 都会被顶掉（409 Conflict: terminated by other getUpdates request）。
+# 所以要短：既让「停用/重启」能及时生效，也把万一多实例时的冲突窗口压到最小。
+LONG_POLL_TIMEOUT = 25
+# 网络层超时要比长轮询挂起时间长，否则正常等待也会被判超时
+API_TIMEOUT = LONG_POLL_TIMEOUT + 20
+
 # 每个会话的上次回复时间，用于最小间隔限流（按机器人分开，避免互相影响）
 _last_reply: dict[tuple[int, str], float] = {}
 
@@ -286,6 +293,9 @@ def _runtime(bot_id: int | None = None) -> dict[str, Any]:
                 "id": key,
                 "thread": None,
                 "stop": None,
+                # 上一代线程：可能是还在长轮询里、没来得及退出的那个。
+                # 新线程必须等它退出才能发 getUpdates。
+                "retiring": None,
                 "recent_lock": threading.RLock(),
                 "recent": {},
                 "state": {
@@ -1020,11 +1030,29 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
 
 # ---------------- 轮询循环 ----------------
 
-def _poll_loop(stop: threading.Event, bot_id: int | None = None) -> None:
+def _poll_loop(stop: threading.Event, bot_id: int | None = None,
+               previous: threading.Thread | None = None) -> None:
+    # 上一代线程可能还挂在长轮询里。必须等它真的退出再发新的 getUpdates，
+    # 否则两个请求同时存在，Telegram 会一直回 409 Conflict。这就是「重启后
+    # 面板上一直提示 Conflict」的真正原因——不是有别的程序在抢，是我们自己。
+    if previous is not None and previous.is_alive():
+        log.info("机器人 %s 等待上一轮长轮询退出后再接管（最多 %s 秒）",
+                 bot_id, API_TIMEOUT)
+        previous.join(timeout=API_TIMEOUT + 10)
+        if previous.is_alive():
+            log.warning("机器人 %s 上一轮轮询仍未退出，强行接管", bot_id)
+
     rt = _runtime(bot_id)
     state = rt["state"]
     backoff = 2.0
     while not stop.is_set():
+        # 机器人记录已经被删掉，但线程还留着：继续跑会去轮询「默认机器人」的 Token，
+        # 和正在运行的那个抢同一条更新流，冲突就永远停不下来。
+        if bot_id is not None and db.get_bot(bot_id) is None:
+            log.info("机器人 %s 已不存在，停止轮询", bot_id)
+            with _lock:
+                state["running"] = False
+            return
         if not enabled(bot_id):
             stop.wait(5)
             continue
@@ -1048,7 +1076,7 @@ def _poll_loop(stop: threading.Event, bot_id: int | None = None) -> None:
                 token,
                 {
                     "offset": offset,
-                    "timeout": 50,
+                    "timeout": LONG_POLL_TIMEOUT,
                     "allowed_updates": [
                         "message",
                         "my_chat_member",
@@ -1056,14 +1084,26 @@ def _poll_loop(stop: threading.Event, bot_id: int | None = None) -> None:
                         "business_message",
                     ],
                 },
-                timeout=70,
+                timeout=API_TIMEOUT,
             )
             backoff = 2.0
             with _lock:
                 state["last_error"] = ""
         except BotError as exc:
+            message = str(exc)
+            if "Conflict" in message:
+                # 同 Token 还有别的请求占着更新流。多半是上一次轮询请求还没断干净，
+                # 通常几十秒内自己就好了，所以用固定短间隔重试，别指数退避到一分钟。
+                with _lock:
+                    state["last_error"] = (
+                        "同一个 Token 有其它实例正在拉取更新，本机正在排队等待"
+                        "（刚重启或刚启用时会出现，一般立即自愈；若长期不消失，"
+                        "说明另有程序在用这个 Token）"
+                    )
+                stop.wait(5)
+                continue
             with _lock:
-                state["last_error"] = str(exc)
+                state["last_error"] = message
             log.warning("拉取更新失败（机器人 %s）：%s", bot_id, exc)
             # token 无效时不要疯跑，退避等待
             stop.wait(min(backoff, 60))
@@ -1100,6 +1140,13 @@ def _poll_loop(stop: threading.Event, bot_id: int | None = None) -> None:
 
 def _start_one(bot_id: int | None = None) -> None:
     rt = _runtime(bot_id)
+    # 已经有机器人记录了，老的「单机器人」运行时就不能再跑：
+    # _record(None) 会回落到默认机器人，等于拿同一个 Token 开两个轮询，必然 409。
+    if not bot_id and db.list_bots():
+        log.info("已有机器人记录，跳过老的单机器人轮询")
+        with _lock:
+            rt["state"]["running"] = False
+        return
     if not token_of(bot_id) or not enabled(bot_id):
         with _lock:
             rt["state"]["running"] = False
@@ -1108,13 +1155,18 @@ def _start_one(bot_id: int | None = None) -> None:
         thread = rt.get("thread")
         if thread is not None and thread.is_alive():
             return
+        # 接着等上一代线程：它可能还在长轮询里挂着
+        previous = rt.get("retiring")
+        rt["retiring"] = None
         stop = threading.Event()
         rt["stop"] = stop
         rt["thread"] = threading.Thread(
-            target=_poll_loop, args=(stop, bot_id),
+            target=_poll_loop, args=(stop, bot_id, previous),
             name=f"bot-poll-{bot_id or DEFAULT_RUNTIME_KEY}", daemon=True,
         )
         rt["state"]["running"] = True
+        # 重启后旧错误已经没意义，先清掉，免得面板上留着一句过时的 Conflict
+        rt["state"]["last_error"] = ""
         rt["state"]["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     rt["thread"].start()
     log.info("机器人 %s 轮询线程已启动", bot_id)
@@ -1126,6 +1178,11 @@ def _stop_one(bot_id: int | None = None) -> None:
         stop = rt.get("stop")
         if stop is not None:
             stop.set()
+        old = rt.get("thread")
+        # 线程还在跑就登记成「退场中」：下一任必须 join 它，不能并行发 getUpdates。
+        # 不 join 直接重建，就是面板上那条 Conflict 的来源。
+        if old is not None and old.is_alive():
+            rt["retiring"] = old
         rt["thread"] = None
         rt["stop"] = None
         rt["state"]["running"] = False

@@ -455,7 +455,10 @@ def create_bot(body: dict[str, Any], _: None = Depends(require_auth)) -> dict[st
         }
     )
     if not STANDBY:
-        bot.start(bot_id)
+        # 统一重启一遍：如果之前跑的是老的单机器人轮询（bot_id=0），
+        # 它和新建的这条会用同一个 Token 抢更新流，必须先停掉。
+        bot.stop()
+        bot.start()
     return {"ok": True, "id": bot_id, "username": info.get("username", ""), "name": info.get("name", "")}
 
 
