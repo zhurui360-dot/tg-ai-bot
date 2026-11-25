@@ -355,7 +355,20 @@
      4. 登录 / 启动
      ====================================================================== */
 
+  // 启动遮罩：HTML 里登录页默认是隐藏的，鉴权结果出来前什么都不显示。
+  // 只有等得久了才亮遮罩，避免刷新时先闪一下登录框。
+  var bootSplashTimer = null;
+
+  function hideBootSplash() {
+    if (bootSplashTimer) {
+      clearTimeout(bootSplashTimer);
+      bootSplashTimer = null;
+    }
+    show($("#bootSplash"), false);
+  }
+
   function showLogin(message) {
+    hideBootSplash();
     modals.slice().forEach(function (m) { m.close(); });
     show($("#appLayout"), false);
     show($("#loginScreen"), true);
@@ -367,6 +380,7 @@
   }
 
   function showApp() {
+    hideBootSplash();
     show($("#loginScreen"), false);
     show($("#appLayout"), true);
     state.ready = true;
@@ -1967,6 +1981,11 @@
 
   async function boot() {
     bindStaticEvents();
+    // 250ms 内能问出结果就完全不显示任何东西（局域网通常这么快），
+    // 超过才亮遮罩，宁可转个圈也别闪登录框。
+    bootSplashTimer = setTimeout(function () {
+      show($("#bootSplash"), true);
+    }, 250);
     try {
       await loadAll();
     } catch (err) {

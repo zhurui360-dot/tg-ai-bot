@@ -142,6 +142,47 @@ a:hover { text-decoration: underline; }
    登录 / 初始化
    ========================================================================== */
 
+/* 启动遮罩：只在鉴权慢的时候才出现（JS 里 250ms 后才亮），
+   避免已登录的人刷新页面先看到登录框闪一下。 */
+.boot-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 16px;
+  background: var(--bg);
+}
+
+.boot-logo {
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: .3px;
+  color: #fff;
+  background: linear-gradient(160deg, var(--brand), var(--brand-deep, #0a6fb0));
+  box-shadow: 0 10px 26px rgba(42, 171, 238, .28);
+}
+
+.boot-spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: var(--brand);
+  animation: spin .8s linear infinite;
+}
+
+/* 用系统设置关闭动画时别转圈，静止就好 */
+@media (prefers-reduced-motion: reduce) {
+  .boot-spinner { animation: none; }
+}
+
 .login-screen {
   position: fixed;
   inset: 0;

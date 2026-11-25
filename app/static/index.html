@@ -11,8 +11,17 @@
 
 <div class="toast-wrap" id="toastWrap"></div>
 
+<!-- 启动遮罩：鉴权要一次网络往返，慢的时候才亮，快的时候什么都不显示。
+     默认隐藏，避免刷新页面时先闪一下登录框。 -->
+<div id="bootSplash" class="boot-splash hidden" aria-hidden="true">
+  <div class="boot-logo">AI</div>
+  <div class="boot-spinner"></div>
+</div>
+
 <!-- ====================== 登录 ====================== -->
-<div id="loginScreen" class="login-screen">
+<!-- 默认隐藏：等 boot 里问过 /api/bootstrap 再决定显示登录页还是主界面，
+     否则已登录的人刷新会看到登录框闪一下。 -->
+<div id="loginScreen" class="login-screen hidden">
   <form class="login-card" id="loginForm">
     <div class="login-logo">AI</div>
     <h2>TG AI 机器人</h2>
@@ -22,6 +31,15 @@
     <p id="panelLoginError" class="err-text"></p>
   </form>
 </div>
+<noscript>
+  <div class="login-screen">
+    <div class="login-card">
+      <div class="login-logo">AI</div>
+      <h2>需要开启 JavaScript</h2>
+      <p class="muted">这个面板是纯前端页面，浏览器禁用脚本后无法加载。</p>
+    </div>
+  </div>
+</noscript>
 
 <!-- ====================== 主体 ====================== -->
 <div class="layout hidden" id="appLayout">
