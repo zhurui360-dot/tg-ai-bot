@@ -209,9 +209,8 @@ def install_code() -> dict[str, Any]:
         log.warning("下载升级包失败：%s", exc)
         return result
 
-    # 先解压到临时目录，成功了再替换。半途失败不会把正在用的代码弄坏。
+    # 先解压到临时目录，成功了再覆盖。半途失败不会把正在用的代码弄坏。
     staging = DATA_DIR / ".code-staging"
-    backup = DATA_DIR / ".code-backup"
     try:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -221,24 +220,38 @@ def install_code() -> dict[str, Any]:
             result["error"] = "升级包里没有文件，可能下载不完整。"
             return result
 
-        # 只覆盖代码，不碰数据目录。保留 data/ 下所有东西。
-        if CODE_DIR.exists():
-            if backup.exists():
-                shutil.rmtree(backup, ignore_errors=True)
-            CODE_DIR.rename(backup)
-        staging.rename(CODE_DIR)
+        # 就地覆盖每一个文件，不要整目录 rename。
+        # 进程的 cwd 认的是 inode 不是路径：把 CODE_DIR 改名后，老进程还待在旧目录里，
+        # 紧接着 execv 出来的新进程也继承那个旧 cwd，于是导入的还是旧代码 ——
+        # 面板显示「已升级」，跑的一直是老版本。就地覆盖才能保证 inode 不变。
+        CODE_DIR.mkdir(parents=True, exist_ok=True)
+        keep: set[Path] = set()
+        for root, _dirs, names in os.walk(staging):
+            rel_dir = Path(root).relative_to(staging)
+            (CODE_DIR / rel_dir).mkdir(parents=True, exist_ok=True)
+            for name in names:
+                src = Path(root) / name
+                shutil.copy2(src, CODE_DIR / rel_dir / name)
+                keep.add(rel_dir / name)
+        # 上游删掉的模块要跟着删，否则残留的旧文件会被继续 import
+        for root, _dirs, names in os.walk(CODE_DIR):
+            for name in names:
+                rel = Path(root).joinpath(name).relative_to(CODE_DIR)
+                if rel not in keep:
+                    try:
+                        (CODE_DIR / rel).unlink()
+                    except OSError:
+                        pass
         # 数据目录是挂载卷，代码副本里不该有它的内容；有就删掉
         stray = CODE_DIR / "data"
         if stray.exists():
             shutil.rmtree(stray, ignore_errors=True)
+        # 清掉老版本 rename 策略留下的备份目录，别一直占着磁盘
+        for leftover in (DATA_DIR / ".code-backup",):
+            if leftover.exists():
+                shutil.rmtree(leftover, ignore_errors=True)
     except Exception as exc:
         log.exception("替换代码失败")
-        # 尽力回滚
-        if not CODE_DIR.exists() and backup.exists():
-            try:
-                backup.rename(CODE_DIR)
-            except OSError:
-                pass
         result["error"] = f"替换代码失败：{type(exc).__name__}"
         return result
     finally:
@@ -283,6 +296,12 @@ def restart_process(delay: float = 1.0) -> None:
         log.info("升级完成，正在重启进程")
         argv = [sys.executable, "-m", "uvicorn", "app.main:app",
                 "--host", host, "--port", port]
+        # 先把工作目录切到代码副本：即使旧进程的 cwd 因为历史原因停在别处
+        # （比如被 rename 走的旧目录），重启后也要从新代码目录导入。
+        try:
+            os.chdir(CODE_DIR)
+        except OSError as exc:
+            log.warning("切到代码目录失败（%s），沿用当前目录", exc)
         try:
             os.execv(sys.executable, argv)
         except Exception as exc:
