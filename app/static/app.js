@@ -1763,8 +1763,11 @@
       text("updVersion", (data.short || "镜像内置") + (data.version ? " · v" + data.version : ""));
       if (data.pending_restart) {
         text("updCommit", (data.short || "镜像内置") + "（已下载 " + data.installed_short + "，待重启）");
+      } else if (!data.short) {
+        text("updCommit", "未记录（老镜像没注入提交号）");
       } else {
-        text("updCommit", data.short ? data.short + (data.installed_at ? "（" + data.installed_at + " 升级）" : "") : "镜像内置版本");
+        var originText = data.origin === "install" ? "面板升级" : (data.origin === "baseline" ? "镜像内置" : "");
+        text("updCommit", data.short + (originText ? "（" + originText + "）" : ""));
       }
       text("updRepo", data.repo + " @ " + data.branch);
       syncRepoLinks(data.repo);

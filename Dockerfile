@@ -5,6 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
     DATA_DIR=/app/data
 
+# 镜像里这份代码对应的提交。CI 构建时传进来，面板据此判断「镜像内置版本」
+# 落后了没有 —— 没有它，首次启动（state 无记录）永远显示「已是最新」。
+# 用 ARG 而不是写死，本地 docker build 不传就是空串，行为退化到「无从判断」。
+ARG GIT_COMMIT=""
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 WORKDIR /app
 
 # gosu 只用来在入口处降权，装完就删 apt 列表；数据目录和代码交给非特权用户

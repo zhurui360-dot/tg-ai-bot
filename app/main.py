@@ -847,12 +847,23 @@ def update_status(_: None = Depends(require_auth)) -> dict[str, Any]:
     state = updater.read_state()
     installed = str(state.get("commit", "") or "")
     running = updater.RUNNING_COMMIT
+    baseline = updater.baseline_commit()
+    # 说清楚当前跑的是哪一份：面板升级过的副本，还是镜像自带的那份基线。
+    # 两者都可能落后，用户要能一眼看出该指望哪条更新通道。
+    if installed and installed == running:
+        origin = "install"
+    elif baseline and baseline[:40] == running[:40]:
+        origin = "baseline"
+    else:
+        origin = ""
     return {
         "version": __version__,
         "repo": updater.REPO,
         "branch": updater.BRANCH,
         "commit": running,
         "short": running[:8] if running else "",
+        "origin": origin,
+        "baseline_commit": baseline,
         "installed_commit": installed,
         "installed_short": installed[:8] if installed else "",
         "pending_restart": bool(installed) and installed != running,

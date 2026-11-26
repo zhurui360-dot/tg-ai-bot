@@ -86,10 +86,25 @@ def current_commit() -> str:
     return str(read_state().get("commit", "") or "")
 
 
+def baseline_commit() -> str:
+    """镜像自带那份代码对应的提交。
+
+    CI 构建时把 `GIT_COMMIT` 写进镜像（Dockerfile 里的 ENV），本地跑源码时没有
+    这个变量，返回空串。它解决的是一个具体的坑：容器首次启动、state 里还没有
+    任何记录时，`current_commit()` 是空串，旧逻辑会把 has_update 判成 False，
+    于是一个落后好几个版本的实例永远显示「已是最新」—— 用户只能靠手动重启
+    容器重建代码副本，但那样又被 entrypoint 的「已有副本不覆盖」挡住。
+    """
+    return os.getenv("GIT_COMMIT", "").strip()[:40]
+
+
 # 进程启动那一刻加载的代码版本，模块导入时算一次就不动了。
 # 和 state 里的 commit 会短暂不一致 —— 这段窗口正是「下载完了还没重启」的状态，
 # 前端靠它判断升级到底生效没生效，而不是被 state 骗过去。
-RUNNING_COMMIT: str = current_commit()
+#
+# 镜像内置版本没有 state 记录，退回到构建时注入的 GIT_COMMIT。两者都空
+# （本地跑源码、或老镜像没注入）才真的一无所知。
+RUNNING_COMMIT: str = current_commit() or baseline_commit()
 
 
 def _get(url: str, timeout: int = 20) -> bytes:
@@ -144,16 +159,17 @@ def check() -> dict[str, Any]:
     result["remote_message"] = info["message"]
     installed = current_commit()
     result["installed_short"] = installed[:8] if installed else ""
+    result["source"] = "install" if installed else ("baseline" if baseline_commit() else "")
     # 代码已经下好、只是还没重启：这种情况不该再说「发现有新版本」，
     # 否则用户会反复点升级、每次都在下载同一份。
     result["pending_restart"] = bool(installed) and installed[:40] == info["sha"] and local[:40] != info["sha"]
     if local:
         result["has_update"] = local[:40] != info["sha"]
     else:
-        # 还没记录过版本（首次跑镜像自带代码），无法判断是否落后，
-        # 但用户点升级总能拿到最新版，这里如实说明。
+        # 连基线提交都没有：老镜像没注入 GIT_COMMIT，无从判断是否落后。
+        # 说清楚，别拍胸脯说「已是最新」。
         result["has_update"] = False
-        result["note"] = "当前是镜像内置版本，点升级会拉取最新代码。"
+        result["note"] = "当前版本没有记录提交，无法判断是否落后。点升级会直接拉取最新代码。"
     if result["pending_restart"]:
         result["has_update"] = True
         result["note"] = f"最新代码 {info['short']} 已下载，重启容器即可生效。"

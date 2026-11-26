@@ -80,8 +80,11 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 双架构：amd64 给常规机器，arm64 给这台 NAS
           platforms: linux/amd64,linux/arm64
+          # 把提交号烧进镜像，面板才能判断「镜像内置版本」落后了没有。
+          # 没有它，首次启动的实例永远显示「已是最新」。
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
           # 这两行是这台 NAS 能拉取的前提，别删
           provenance: false
           sbom: false
