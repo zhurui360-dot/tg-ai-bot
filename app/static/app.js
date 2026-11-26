@@ -151,6 +151,7 @@
     usage: null,
     memAgent: "",
     memScope: "",
+    remStatus: "pending",
     lastDiag: null
   };
 
@@ -446,7 +447,11 @@
       ? state.shortCommit
       : "v" + state.version;
     text("verLabel", verText + (state.standby ? " · 值守" : ""));
-    if (state.commit) $("#verLabel").title = "运行中的代码提交：" + state.commit;
+    // 版本号本身是仓库链接，title 里既交代提交又说明能点
+    var verNode = $("#verLabel");
+    if (verNode) {
+      verNode.title = (state.commit ? "运行中的代码提交：" + state.commit + "　" : "") + "点击在 GitHub 上打开项目";
+    }
     text("navBotCount", String(state.bots.length));
     text("navAgentCount", String((data.ai_agents || []).length));
 
@@ -509,6 +514,7 @@
       // 先读本地状态把卡片填上，再去 GitHub 核对一次有没有新版本
       loadUpdateStatus().then(autoCheckUpdate);
       loadBackupStatus();
+      loadReminders().catch(function (err) { console.warn("提醒列表加载失败", err); });
     } else {
       loadMessages(12).then(renderDashboard).catch(function () {});
       loadUsage().then(renderUsage);
@@ -1484,6 +1490,17 @@
     if ($("#setMemEnabled")) $("#setMemEnabled").checked = String(s.memory_enabled) === "1";
     if ($("#setMemLearn")) $("#setMemLearn").checked = String(s.memory_learn) === "1";
     if ($("#setMemMax")) $("#setMemMax").value = s.memory_max_notes || "8";
+    if ($("#setToolsEnabled")) $("#setToolsEnabled").checked = String(s.tools_enabled) === "1";
+    if ($("#setToolsReminders")) $("#setToolsReminders").checked = String(s.tools_reminders) === "1";
+    if ($("#setToolsSearch")) $("#setToolsSearch").checked = String(s.tools_web_search) === "1";
+    if ($("#setToolsRename")) $("#setToolsRename").checked = String(s.tools_rename) === "1";
+    if ($("#setOwnerId")) $("#setOwnerId").value = s.owner_id || "";
+    var toolsWarn = $("#toolsWarn");
+    if (toolsWarn) {
+      toolsWarn.textContent = s.owner_id
+        ? ""
+        : "还没填管理员 ID，改名功能不会生效";
+    }
     var warn = $("#pwdWarn");
     if (warn) {
       warn.textContent = s.using_default_password
@@ -1545,6 +1562,149 @@
     }
   }
 
+  async function saveToolsSettings(btn) {
+    var owner = ($("#setOwnerId").value || "").trim().replace(/^@/, "");
+    if (owner && !/^\d+$/.test(owner)) {
+      toast("管理员要填纯数字 ID，不是 @用户名。给它发 /id 就能看到", "err");
+      $("#setOwnerId").focus();
+      return;
+    }
+    if (!owner && $("#setToolsRename").checked) {
+      // 不拦，但要让人明白为什么改名没反应——这是最常见的「明明开了却不能用」
+      toast("没填管理员 ID，改名功能仍然不会生效", "warn");
+    }
+    var payload = {
+      tools_enabled: $("#setToolsEnabled").checked ? "1" : "0",
+      tools_reminders: $("#setToolsReminders").checked ? "1" : "0",
+      tools_web_search: $("#setToolsSearch").checked ? "1" : "0",
+      tools_rename: $("#setToolsRename").checked ? "1" : "0",
+      owner_id: owner
+    };
+    busy(btn, true);
+    try {
+      await api("/api/settings", { method: "PUT", body: payload });
+      toast("能力设置已保存", "ok");
+      var data = await api("/api/bootstrap");
+      applyBootstrap(data);
+      await loadReminders();
+    } catch (err) {
+      toast(err.message, "err");
+    } finally {
+      busy(btn, false);
+    }
+  }
+
+  /* 提醒列表。时间一律用后端算好的 due_local 显示，
+     前端不碰 UTC，省得跟浏览器时区打架。 */
+
+  var REM_STATUS = {
+    pending: { label: "待发", cls: "brand" },
+    done: { label: "已发", cls: "ok" },
+    failed: { label: "失败", cls: "err" },
+    canceled: { label: "已取消", cls: "" }
+  };
+
+  async function loadReminders() {
+    var box = $("#reminderList");
+    if (!box) return;
+    box.innerHTML = '<p class="dim small mb-0">加载中…</p>';
+    var status = state.remStatus || "pending";
+    var data;
+    try {
+      data = await api("/api/reminders?status=" + encodeURIComponent(status) + "&limit=100");
+    } catch (err) {
+      box.innerHTML = '<p class="dim small mb-0">' + esc(err.message) + "</p>";
+      return;
+    }
+    renderReminders(data, status);
+  }
+
+  function renderReminders(data, status) {
+    var box = $("#reminderList");
+    if (!box) return;
+    var items = data.items || [];
+    var sch = data.scheduler || {};
+
+    var hint = $("#remHint");
+    if (hint) {
+      var bits = [];
+      if (sch.running) {
+        bits.push("调度器运行中，每 " + num(sch.interval, 20) + " 秒扫一次");
+      } else if (state.standby) {
+        bits.push("当前是值守模式，调度器不启动（避免和主实例重复发）");
+      } else {
+        bits.push("调度器未运行");
+      }
+      bits.push("待发 " + num(sch.pending, 0) + " 条");
+      hint.textContent = bits.join(" · ");
+    }
+
+    if (!items.length) {
+      var emptyText = status === "pending"
+        ? "还没有待发的提醒。在聊天里说「20 分钟后提醒我关火」就会出现在这里。"
+        : (status === "done"
+            ? "还没有发过的提醒。"
+            : (status === "failed" ? "没有失败的提醒——挺好。" : "一条提醒都没有。"));
+      box.innerHTML = emptyState("这里空着", emptyText);
+      return;
+    }
+
+    box.innerHTML = '<div class="row-list">' + items.map(function (item) {
+      var meta = REM_STATUS[item.status] || { label: item.status || "未知", cls: "" };
+      var when = item.due_local || item.due_exact || "";
+      var sub = [];
+      if (item.chat_title) sub.push(item.chat_title);
+      if (item.author) sub.push("提的：" + item.author);
+      if (item.status === "failed" && item.last_error) sub.push("报错：" + truncate(item.last_error, 40));
+      if (item.status === "done" && item.fired_at) sub.push("发出于 " + fmtTime(item.fired_at));
+      if (item.tries && item.status !== "done") sub.push("试过 " + num(item.tries, 0) + " 次");
+
+      return (
+        '<div class="row-item">' +
+          '<div class="avatar' + (item.status === "done" ? " ok" : (item.status === "failed" ? " warn" : "")) + '">' +
+            esc(firstChar(item.text || "提")) + "</div>" +
+          '<div class="grow">' +
+            '<div class="title">' + esc(item.text || "（空内容）") +
+              '<span class="badge ' + meta.cls + '">' + esc(meta.label) + "</span>" +
+            "</div>" +
+            '<div class="meta">' + esc(sub.length ? sub.join(" · ") : when) + "</div>" +
+          "</div>" +
+          '<div class="actions">' +
+            '<span class="dim small" style="margin-right:2px">' + esc(when) + "</span>" +
+            '<button class="btn sm ghost" type="button" data-act="rem-del" data-id="' + esc(item.id) +
+              '" data-text="' + esc(item.text || "") + '">删除</button>' +
+          "</div>" +
+        "</div>"
+      );
+    }).join("") + "</div>";
+  }
+
+  function setRemStatus(status) {
+    state.remStatus = status || "";
+    $$("#remTabs .tab").forEach(function (tab) {
+      tab.classList.toggle("on", (tab.dataset.status || "") === state.remStatus);
+    });
+    loadReminders().catch(function (err) { toast(err.message, "err"); });
+  }
+
+  async function deleteReminder(btn) {
+    var id = btn.dataset.id;
+    var ok = await confirmDialog({
+      title: "删掉这条提醒？",
+      message: "「" + (btn.dataset.text || "") + "」删掉后到点就不会再发。",
+      okText: "删除",
+      danger: true
+    });
+    if (!ok) return;
+    try {
+      await api("/api/reminders/" + encodeURIComponent(id), { method: "DELETE" });
+      toast("已删除", "ok");
+      await loadReminders();
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  }
+
   async function clearMessages(btn) {
     var ok = await confirmDialog({
       title: "清空对话记录？",
@@ -1570,6 +1730,31 @@
      12. 在线升级
      ====================================================================== */
 
+  // 仓库地址不是写死的：升级源可以换成自己的 fork（UPDATE_REPO 环境变量），
+  // 卡片上的链接必须跟着变，否则会把用户带到官方仓库去。
+  function syncRepoLinks(repo) {
+    if (!repo) return;
+    var slug = String(repo).trim();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return;  // 不是 owner/name 就别拼链接
+    var web = "https://github.com/" + slug;
+    var pairs = [
+      ["aboutRepo", web],
+      ["aboutIssues", web + "/issues"],
+      ["aboutOpen", web]
+    ];
+    pairs.forEach(function (pair) {
+      var node = $("#" + pair[0]);
+      if (node) node.setAttribute("href", pair[1]);
+    });
+    var label = $("#aboutRepo");
+    if (label) label.textContent = "github.com/" + slug;
+    var clone = $("#aboutClone");
+    if (clone) clone.textContent = web + ".git";
+    // 复制按钮的 data-copy 在 HTML 里写死，换仓库时要同步
+    var copyBtn = document.querySelector('[data-act="copy"][data-clone-target]');
+    if (copyBtn) copyBtn.dataset.copy = web + ".git";
+  }
+
   async function loadUpdateStatus() {
     try {
       var data = await api("/api/update/status");
@@ -1582,6 +1767,7 @@
         text("updCommit", data.short ? data.short + (data.installed_at ? "（" + data.installed_at + " 升级）" : "") : "镜像内置版本");
       }
       text("updRepo", data.repo + " @ " + data.branch);
+      syncRepoLinks(data.repo);
       text("updCheckedAt", data.last_check ? "上次检查 " + data.last_check : "");
       // 代码下了但没重启，说明上次升级卡在重启环节，提示手动处理
       if (data.pending_restart) {
@@ -2085,6 +2271,10 @@
     "note-del": deleteNote,
     "save-panel": savePanelSettings,
     "save-memory": saveMemorySettings,
+    "save-tools": saveToolsSettings,
+    "rem-tab": function (btn) { setRemStatus(btn.dataset.status || ""); },
+    "rem-refresh": function () { loadReminders().catch(function (err) { toast(err.message, "err"); }); },
+    "rem-del": deleteReminder,
     "update-check": checkUpdate,
     "update-apply": applyUpdate,
     "backup-push": pushBackup,

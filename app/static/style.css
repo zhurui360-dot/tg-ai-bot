@@ -130,6 +130,10 @@ body {
 button, input, select, textarea { font: inherit; color: inherit; }
 a { color: var(--brand); text-decoration: none; }
 a:hover { text-decoration: underline; }
+/* a 也当按钮用时（比如「打开 GitHub」），别继承链接的蓝色和下划线 */
+a.btn { text-decoration: none; color: var(--text); }
+a.btn:hover { text-decoration: none; }
+a.btn.primary { color: #fff; }
 
 .hidden { display: none !important; }
 
@@ -381,6 +385,18 @@ a:hover { text-decoration: underline; }
   color: var(--sb-text);
   font-size: 11px;
   opacity: .7;
+}
+
+/* 版本号同时也是仓库入口，鼠标移上去给点反馈，不然看不出能点 */
+.sidebar-foot .ver.gh-link {
+  display: block;
+  text-decoration: none;
+  transition: color .15s, opacity .15s;
+}
+.sidebar-foot .ver.gh-link:hover {
+  color: var(--brand);
+  opacity: 1;
+  text-decoration: none;
 }
 
 /* 侧栏里的退出按钮：复用导航项样式，只压一点存在感 */

@@ -57,6 +57,16 @@ DEFAULTS: dict[str, str] = {
     "backup_auto": "0",      # 1 = 定时自动备份
     "backup_interval": "1440",  # 分钟，默认一天
     "backup_proxy": "",
+    # ---------- 能力（工具调用）----------
+    # 总开关。关掉后模型不再收到工具协议说明，也不会解析任何动作标记。
+    "tools_enabled": "1",
+    # 每个能力单独开关：用户可以只留提醒、关掉联网，避免被群里的人拿去乱搜
+    "tools_reminders": "1",
+    "tools_web_search": "1",
+    "tools_rename": "1",
+    # 管理员（Telegram 数字 ID）。只有他/她能让机器人改名字、看别人的提醒。
+    # 留空表示谁都改不了——宁可功能不可用，也不能让群里随便一个人改名。
+    "owner_id": "",
 }
 
 # settings 里存的是只有一份的全局配置；这些键在升级后由 _seed_agents 搬进智能体
@@ -162,6 +172,25 @@ def init_db() -> None:
                 ts         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_usage_ts ON ai_usage(ts);
+            -- 提醒。到期由 scheduler 线程扫描后发回原会话。
+            -- due_at 存 UTC 的 ISO8601 字符串（不带时区偏移），排序即时间序。
+            CREATE TABLE IF NOT EXISTS reminders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id   INTEGER NOT NULL DEFAULT 0,
+                bot_id     INTEGER NOT NULL DEFAULT 0,
+                chat_id    TEXT NOT NULL,
+                chat_title TEXT NOT NULL DEFAULT '',
+                author     TEXT NOT NULL DEFAULT '',
+                author_id  TEXT NOT NULL DEFAULT '',
+                text       TEXT NOT NULL DEFAULT '',
+                due_at     TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'pending',
+                tries      INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                fired_at   TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, due_at);
             """
         )
         for key, value in DEFAULTS.items():
@@ -565,6 +594,119 @@ def note_stats(agent_id: int) -> dict[str, int]:
         data[str(row["scope"])] = int(row["n"])
         data["total"] += int(row["n"])
     return data
+
+
+# ---------------- 提醒（reminders） ----------------
+# 时间一律存 UTC。面板和机器人回复时再按 settings.timezone 转本地，
+# 避免「服务器在 UTC、用户在 UTC+8，差 8 小时」这类最常见的定时错误。
+
+def add_reminder(
+    agent_id: int,
+    bot_id: int,
+    chat_id: str,
+    chat_title: str,
+    author: str,
+    author_id: str,
+    text: str,
+    due_at: str,
+) -> int:
+    with connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO reminders(agent_id, bot_id, chat_id, chat_title, author, "
+            "author_id, text, due_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                int(agent_id or 0),
+                int(bot_id or 0),
+                str(chat_id),
+                chat_title[:120],
+                author[:80],
+                str(author_id or "")[:32],
+                text[:400],
+                str(due_at),
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+
+def due_reminders(now_utc: str, limit: int = 20) -> list[dict[str, Any]]:
+    """到点且还没发的。只取 pending，failed 不自动重试——重试交给调度线程控制。"""
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM reminders WHERE status='pending' AND due_at<=? "
+            "ORDER BY due_at LIMIT ?",
+            (str(now_utc), max(1, min(int(limit), 100))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_reminders(
+    agent_id: int | None = None,
+    chat_id: str | None = None,
+    author_id: str | None = None,
+    status: str = "pending",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM reminders WHERE 1=1"
+    params: list[Any] = []
+    if agent_id is not None:
+        sql += " AND agent_id=?"
+        params.append(int(agent_id))
+    if chat_id:
+        sql += " AND chat_id=?"
+        params.append(str(chat_id))
+    if author_id:
+        sql += " AND author_id=?"
+        params.append(str(author_id))
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    sql += " ORDER BY due_at LIMIT ?"
+    params.append(max(1, min(int(limit), 300)))
+    with connection() as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def get_reminder(reminder_id: int) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM reminders WHERE id=?", (int(reminder_id),)).fetchone()
+    return None if row is None else dict(row)
+
+
+def mark_reminder(reminder_id: int, status: str, error: str = "") -> None:
+    with connection() as conn:
+        conn.execute(
+            "UPDATE reminders SET status=?, tries=tries+1, last_error=?, "
+            "fired_at=CASE WHEN ?='done' THEN CURRENT_TIMESTAMP ELSE fired_at END "
+            "WHERE id=?",
+            (status, str(error or "")[:300], status, int(reminder_id)),
+        )
+
+
+def delete_reminder(reminder_id: int) -> bool:
+    with connection() as conn:
+        cursor = conn.execute("DELETE FROM reminders WHERE id=?", (int(reminder_id),))
+        return cursor.rowcount > 0
+
+
+def cancel_reminders(
+    agent_id: int,
+    chat_id: str,
+    author_id: str,
+    keyword: str = "",
+) -> list[dict[str, Any]]:
+    """取消这个人在这会话里还没发的提醒。带关键词就只取消匹配的。"""
+    rows = list_reminders(agent_id, chat_id, author_id, status="pending", limit=200)
+    picked = [
+        row for row in rows
+        if not keyword or keyword.strip() in str(row.get("text") or "")
+    ]
+    if picked:
+        with connection() as conn:
+            conn.executemany(
+                "UPDATE reminders SET status='canceled' WHERE id=?",
+                [(int(row["id"]),) for row in picked],
+            )
+    return picked
 
 
 # ---------------- 智能体 ----------------

@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, backup, bot, db, memory, security, updater
+from . import __version__, backup, bot, db, memory, scheduler, security, tools, updater
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -42,12 +42,16 @@ async def lifespan(app: FastAPI):
         log.warning("STANDBY=1：值守模式，只提供面板，不启动机器人")
     else:
         bot.start()
+        # 提醒调度只在真正跑机器人的进程里启动：值守实例若也跑，会和生产实例
+        # 抢同一份数据库，同一条提醒可能被发两次。
+        scheduler.start()
     # 自动备份线程：只有开了开关且配了仓库+Token 才会真正干活
     backup.auto.start()
     log.info("TG AI Bot %s 已启动", __version__)
     yield
     backup.auto.stop()
     if not STANDBY:
+        scheduler.stop()
         bot.stop()
 
 
@@ -207,6 +211,13 @@ def bootstrap(_: None = Depends(require_auth)) -> dict[str, Any]:
             "memory_learn": settings.get("memory_learn", "1"),
             "memory_max_notes": settings.get("memory_max_notes", "8"),
             "bot_trigger": settings.get("bot_trigger", "mention"),
+            # 能力开关。面板要能回填，否则每次刷新都显示成关闭，
+            # 用户会以为自己没保存成功。
+            "tools_enabled": settings.get("tools_enabled", "1"),
+            "tools_reminders": settings.get("tools_reminders", "1"),
+            "tools_web_search": settings.get("tools_web_search", "1"),
+            "tools_rename": settings.get("tools_rename", "1"),
+            "owner_id": settings.get("owner_id", ""),
         },
         "bots": [
             {
@@ -237,9 +248,12 @@ SETTING_KEYS = {
     "ai_history_len", "ai_max_tokens", "ai_temperature", "ai_min_interval",
     "ai_proxy", "ai_vision",
     "memory_enabled", "memory_learn", "memory_max_notes",
+    # 能力开关。owner_id 单独校验，不放进 TOGGLE_KEYS。
+    "tools_enabled", "tools_reminders", "tools_web_search", "tools_rename", "owner_id",
 }
 SECRET_KEYS = {"panel_password", "bot_token", "ai_api_key"}
-TOGGLE_KEYS = {"memory_enabled", "memory_learn", "bot_enabled", "ai_vision"}
+TOGGLE_KEYS = {"memory_enabled", "memory_learn", "bot_enabled", "ai_vision",
+               "tools_enabled", "tools_reminders", "tools_web_search", "tools_rename"}
 BOT_NUMERIC_KEYS = {"ai_history_len", "ai_max_tokens", "ai_temperature", "ai_min_interval"}
 
 
@@ -270,6 +284,14 @@ def update_settings(body: dict[str, Any], _: None = Depends(require_auth)) -> di
         if key == "ai_agent_id" and value:
             if not value.isdigit() or not db.get_agent(int(value)):
                 raise HTTPException(status_code=400, detail="指定的 AI 智能体不存在")
+        if key == "owner_id" and value:
+            # Telegram 用户 ID 一定是纯数字。这里不校验的话，用户填个 @username
+            # 会保存成功但永远匹配不上，表现为「改名功能莫名不可用」。
+            if not value.isdigit():
+                raise HTTPException(
+                    status_code=400,
+                    detail="管理员要填 Telegram 数字 ID（给机器人发 /id 就能看到），不是 @用户名",
+                )
         if key == "memory_max_notes" and value:
             db.set_setting(key, str(max(1, min(int(float(value)), 20))))
             changed.add(key)
@@ -699,6 +721,42 @@ def test_ai_agent(agent_id: int, _: None = Depends(require_auth)) -> dict[str, A
         return bot.test_ai(agent=agent)
     except bot.BotError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ---------------- 能力：提醒 ----------------
+
+@app.get("/api/reminders")
+def list_reminders(
+    status: str = Query("pending"),
+    limit: int = Query(100),
+    _: None = Depends(require_auth),
+) -> dict[str, Any]:
+    """面板看所有提醒。时间在这里就翻成本地时间——前端不用再懂 UTC 换算。"""
+    if status and status not in ("pending", "done", "failed", "canceled", ""):
+        raise HTTPException(status_code=400, detail="status 只能是 pending/done/failed/canceled")
+    rows = db.list_reminders(status=status or "", limit=limit)
+    for row in rows:
+        row["due_local"] = tools.human_local(str(row.get("due_at") or ""))
+        row["due_exact"] = _fmt_local(str(row.get("due_at") or ""))
+    return {
+        "items": rows,
+        "scheduler": scheduler.status(),
+        "tools": {name: tools.enabled(name) for name in tools.available()},
+    }
+
+
+def _fmt_local(utc_iso: str) -> str:
+    try:
+        return tools.from_utc_iso(utc_iso).astimezone(tools._tz()).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return str(utc_iso)
+
+
+@app.delete("/api/reminders/{reminder_id}")
+def remove_reminder(reminder_id: int, _: None = Depends(require_auth)) -> dict[str, Any]:
+    if not db.delete_reminder(reminder_id):
+        raise HTTPException(status_code=404, detail="这条提醒不存在")
+    return {"ok": True}
 
 
 # ---------------- 智能体记忆 ----------------

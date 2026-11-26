@@ -19,6 +19,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -26,7 +27,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from . import db, memory, security
+from . import db, memory, security, tools
 
 log = logging.getLogger("tg-ai-bot.bot")
 
@@ -496,6 +497,20 @@ def _ai_messages(
     recalled = memory.context(agent_id, chat_id, author, user_text, limit=max_notes)
     if recalled:
         messages.append({"role": "system", "content": recalled})
+
+    # 工具协议：只在总开关打开时注入。关掉后模型根本不知道有 [ACT] 这回事，
+    # 也就不会写出标记——这比「写了但被忽略」干净，也省 token。
+    if tools.enabled("list_reminders"):
+        now = tools.now_local()
+        week = "一二三四五六日"[now.weekday()]
+        messages.append({
+            "role": "system",
+            "content": (
+                f"现在是 {now.strftime('%Y年%m月%d日 %H:%M')}（星期{week}），"
+                f"时区 {db.get_setting('timezone', 'Asia/Shanghai')}。\n"
+                + tools.PROTOCOL
+            ),
+        })
 
     try:
         history_len = max(0, min(int(cfg.get("ai_history_len", "12")), 40))
@@ -1229,6 +1244,174 @@ def _reply(
             raise
 
 
+def _execute_actions(
+    answer: str,
+    messages: list[dict[str, Any]],
+    ctx: tools.Ctx,
+    agent: dict[str, Any] | None,
+    chat_id: Any,
+    biz: str | None,
+    bot_id: int | None,
+) -> str:
+    """解析模型输出里的动作标记，执行，然后把结果回灌让模型讲人话。
+
+    最多两轮：模型第一次可以带动作，拿到结果后第二次只允许说话。
+    第三轮开始一律停——用户要的是答案，不是无限自问自答。
+    """
+    if db.get_setting("tools_enabled", "1") != "1":
+        # 关掉工具后别让用户看到裸标记
+        clean, _ = tools.parse_actions(answer)
+        return clean or answer
+
+    clean, actions = tools.parse_actions(answer)
+    if not actions:
+        return clean or answer
+
+    outcomes: list[str] = []
+    for action in actions:
+        outcome = tools.run(ctx, action)
+        outcomes.append(f"[{action['tool']}] {tools.result_text(outcome)}")
+        log.info("动作 %s -> ok=%s", action["tool"], outcome.get("ok"))
+
+    # 把「模型说了什么」和「工具干了什么」都塞回上下文，再要一句总结
+    follow = list(messages)
+    follow.append({"role": "assistant", "content": clean or "（调用工具）"})
+    follow.append({
+        "role": "user",
+        "content": (
+            "（系统消息，用户看不到）工具已经执行完，结果如下：\n"
+            + "\n".join(outcomes)
+            + "\n请用自然的话告诉用户结果。不要再输出 [ACT] 标记，也要把工具返回的 JSON 转成人话。"
+        ),
+    })
+    try:
+        final = call_ai(follow, agent=agent, usage_kind="chat") or ""
+    except BotError as exc:
+        # 总结失败也要给用户一个交代，不能把裸 JSON 甩出去
+        log.warning("工具结果总结失败：%s", exc)
+        return clean or "\n".join(outcomes)
+
+    # 万一第二次它还写标记，剥掉但不执行——避免连环调用
+    final_clean, _ = tools.parse_actions(final)
+    return final_clean or clean or "\n".join(outcomes)
+
+
+# ---------------- 显式命令 ----------------
+# 有些事不该赌模型能不能理解。「取消所有提醒」「改名叫 X」这种，用命令直达。
+
+_COMMAND_HELP = (
+    "可用命令：\n"
+    "/id —— 看自己的 Telegram 数字 ID（用来设管理员）\n"
+    "/remind 20m 喝水 —— 设提醒（支持 20m / 2h / 明天9点 / 2026-11-27 09:00）\n"
+    "/reminders —— 看还没触发的提醒\n"
+    "/cancel —— 取消自己所有未触发的提醒\n"
+    "/name 新名字 —— 给机器人改名（仅管理员）\n"
+    "/search 关键词 —— 联网搜一下\n"
+    "/help —— 显示这段说明"
+)
+
+_CMD_RE = re.compile(r"^/(\w+)(?:@\w+)?\s*(.*)$", re.S)
+
+
+def _parse_when(raw: str) -> tuple[int | None, str]:
+    """把「20m / 2h / 90 / 明天9点 / 2026-11-27 09:00」变成分钟数或绝对时间串。
+
+    返回 (分钟数或 None, 绝对时间串或 "")，两个都空表示看不懂。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, ""
+    # 先剥掉「后 / 之后 / 以后」这类尾巴：90分钟后 = 90分钟
+    text = re.sub(r"\s*(?:之后|以后|后)$", "", text).strip() or text
+    # 只有「纯数字 + 单位」才算相对时间。不带单位时按分钟算，
+    # 但「明天9点」这种含中文的绝不能落进这里，否则 9 会被当成 9 分钟。
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*(m|min|分钟|分|h|hour|小时|个?小时|d|天)?$", text, re.I)
+    if match and (match.group(2) or text.replace(".", "").isdigit()):
+        value = float(match.group(1))
+        unit = (match.group(2) or "m").lower()
+        if unit in ("h", "hour", "小时", "个小时"):
+            value *= 60
+        elif unit in ("d", "天"):
+            value *= 1440
+        return int(round(value)), ""
+    # 其余交给 tools 的时间解析（明天9点、下午三点半它都认）
+    return None, text
+
+
+def _run_command(text: str, ctx: tools.Ctx, is_private: bool) -> str | None:
+    """命中命令就返回要回的话，没命中返回 None（继续走模型）。"""
+    match = _CMD_RE.match((text or "").strip())
+    if not match:
+        return None
+    name = match.group(1).lower()
+    arg = (match.group(2) or "").strip()
+
+    if name in ("help", "帮助", "start"):
+        return _COMMAND_HELP
+
+    if name == "id":
+        if not ctx.author_id:
+            return "拿不到你的 ID。这条消息里没有发送者信息。"
+        owner = (db.get_setting("owner_id", "") or "").strip()
+        mine = "（这就是当前管理员）" if owner == ctx.author_id else ""
+        hint = "" if owner else "\n把这个 ID 填到面板「能力 → 管理员」里，就能用改名等管理命令。"
+        return f"你的 Telegram ID 是 {ctx.author_id}{mine}{hint}"
+
+    if name == "remind":
+        if not tools.enabled("set_reminder"):
+            return "提醒功能被关掉了，去面板「能力」里打开。"
+        when_raw, body = tools.split_time_prefix(arg)
+        if not when_raw or not body:
+            return "用法：/remind 20m 喝水\n时间支持 10m / 2h / 明天9点 / 2026-11-27 09:00"
+        minutes, when = _parse_when(when_raw)
+        args: dict[str, Any] = {"text": body}
+        if minutes:
+            args["minutes"] = minutes
+        elif when:
+            args["at"] = when
+        else:
+            return "时间没看懂，试试 20m / 2h / 明天9点 / 2026-11-27 09:00"
+        outcome = tools.run(ctx, {"tool": "set_reminder", "args": args})
+        return tools.result_text(outcome)
+
+    if name == "reminders":
+        outcome = tools.run(ctx, {"tool": "list_reminders", "args": {}})
+        return tools.result_text(outcome)
+
+    if name == "cancel":
+        outcome = tools.run(ctx, {"tool": "cancel_reminder", "args": {"keyword": arg}})
+        return tools.result_text(outcome)
+
+    if name == "name":
+        if not tools.enabled("rename_self"):
+            return "改名功能被关掉了，去面板「能力」里打开。"
+        if not tools.is_owner(ctx.author_id):
+            return "只有机器人主人能改名字。用 /id 看自己的 ID，让管理员填进面板。"
+        if not arg:
+            return "用法：/name 新名字"
+        outcome = tools.run(ctx, {"tool": "rename_self", "args": {"name": arg}})
+        return tools.result_text(outcome)
+
+    if name == "search":
+        if not tools.enabled("web_search"):
+            return "联网搜索被关掉了，去面板「能力」里打开。"
+        if not arg:
+            return "用法：/search 关键词"
+        outcome = tools.run(ctx, {"tool": "web_search", "args": {"query": arg}})
+        if not outcome.get("ok"):
+            return tools.result_text(outcome)
+        items = outcome.get("items") or []
+        if not items:
+            return tools.result_text(outcome)
+        lines = [f"搜到 {len(items)} 条："]
+        for index, item in enumerate(items[:4], 1):
+            lines.append(f"{index}. {item['title']}\n{item['url']}")
+        return "\n".join(lines)
+
+    # 不认识的命令不要吞掉：可能用户就是想聊「/foo 是什么」
+    return None
+
+
 def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
     agent = db.agent_for_bot(bot_id)
     cfg = _agent_cfg(agent)
@@ -1374,12 +1557,33 @@ def _handle_message(message: dict[str, Any], bot_id: int | None = None) -> None:
     db.add_ai_message(storage_id, title, "user", author, stored, bot_id=scope_id,
                       author_id=author_id)
 
+    ctx = tools.Ctx(agent, bot_id, storage_id, title, author, author_id)
+
+    # 显式命令先走一遍：用户打 /remind 这种就该立刻生效，不该让模型去猜意图。
+    # 命令命中就直接回，连模型都不调用——省一次调用，也不会被模型改写格式。
+    command_reply = _run_command(text, ctx, is_private)
+    if command_reply is not None:
+        typing_stop.set()
+        db.add_ai_message(storage_id, title, "assistant", "bot", command_reply,
+                          bot_id=scope_id, author_id=author_id)
+        try:
+            _reply(chat_id, command_reply, message.get("message_id"), biz, bot_id)
+        except BotError:
+            return
+        _last_reply[key] = time.time()
+        with _lock:
+            state["replies"] = int(state.get("replies", 0)) + 1
+        return
+
     try:
         messages = _ai_messages(
             storage_id, text, author, is_private, bot_id, agent,
             author_id=author_id, extra=image_parts,
         )
         answer = call_ai(messages, agent=agent, usage_kind="chat") or "（模型没有返回内容）"
+        # 模型可能要求调工具。执行完把结果回灌，最多再问一次——
+        # 不给它无限轮次，否则一次对话能烧掉十几次调用。
+        answer = _execute_actions(answer, messages, ctx, agent, chat_id, biz, bot_id)
     except BotError as exc:
         log.warning("AI 调用失败：%s", exc)
         # 同步到面板状态，否则用户只能翻容器日志才知道为什么没回复
@@ -1680,6 +1884,15 @@ def status(bot_id: int | None = None) -> dict[str, Any]:
 def bot_detail(bot_id: int) -> dict[str, Any]:
     """面板拉某个机器人的状态时用，避免和汇总混在一起。"""
     return _status_one(bot_id)
+
+
+def send_to(chat_id: Any, text: str, bot_id: int | None = None) -> None:
+    """往指定会话发一条消息，不带「回复某条」。定时提醒用它。
+
+    没有 reply_to 是因为提醒触发时那条原始消息可能已经是几小时前的，
+    带上引用会让聊天界面跳回去，反而干扰。
+    """
+    _reply(chat_id, text, None, None, bot_id)
 
 
 def send_test_message(chat_id: str, text: str, bot_id: int | None = None) -> dict[str, Any]:
