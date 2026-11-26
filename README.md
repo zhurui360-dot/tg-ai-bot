@@ -158,17 +158,15 @@ docker pull ghcr.io/zhurui360-dot/tg-ai-bot:latest
 
 数据只在 `/app/data` 里，换镜像升级不影响。
 
-**自动更新**：起一个 watchtower，把它指到容器名上，30 分钟轮询一次，有新镜像就自动重建：
+**日常更新走面板，不用 watchtower**：设置 → 在线升级 → 检查更新 → 立即升级。
+容器里跑的是 `$DATA_DIR/code` 那份可写副本，升级时覆盖它再重启进程。
 
-```bash
-docker run -d --name tg-watchtower --restart always \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  nickfedor/watchtower --cleanup --interval 1800 tg-ai-bot
-```
+> 别指望「拉新镜像」等于「更新代码」：`docker-entrypoint.sh` 只在代码副本
+> 不存在时才从镜像拷基线，已有副本不覆盖（那可能是你升级过的版本）。
 
-之后「改代码 → push main」就是一次发布，不用登 NAS。
-
-> 这条路要求容器**不能挂源码目录**。挂了源码就等于把镜像里的代码覆盖掉，watchtower 换了镜像也没用——这是必须走镜像而非源码挂载的根本原因。
+镜像里烧了一个 `GIT_COMMIT`（CI 用 `--build-arg GIT_COMMIT=${{ github.sha }}`
+注入），面板靠它判断「镜像内置版本」落后了没有。本地 `docker build` 不传这个
+参数时就无从判断，面板会如实说「未记录」。
 
 ### 路线 B：自己 build
 
